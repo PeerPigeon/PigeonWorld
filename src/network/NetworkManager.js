@@ -1,5 +1,8 @@
-import { PeerPigeonMesh } from 'peerpigeon';
-import { PigeonMatch } from 'pigeonmatch';
+// PeerPigeon is loaded globally from browser bundle
+// PigeonMatch is loaded as ES module
+import { MatchmakingEngine, MatchmakingEvent } from 'pigeonmatch';
+
+const { PeerPigeonMesh } = window;
 
 /**
  * Network Manager for multiplayer functionality
@@ -8,7 +11,7 @@ import { PigeonMatch } from 'pigeonmatch';
 export class NetworkManager {
     constructor() {
         this.mesh = null;
-        this.matcher = null;
+        this.matchmaker = null;
         this.peerId = null;
         this.peers = new Map();
         this.players = new Map();
@@ -40,9 +43,22 @@ export class NetworkManager {
             
             console.log('Connected to signaling server');
 
-            // Initialize PigeonMatch for matchmaking
-            this.matcher = new PigeonMatch(this.mesh);
-            await this.matcher.init();
+            // Initialize PigeonMatch matchmaking engine
+            this.matchmaker = new MatchmakingEngine({
+                maxPeers: 100,
+                namespace: this.worldId,
+                matchTimeout: 30000,
+                mesh: this.mesh
+            });
+
+            // Set up matchmaking event handlers
+            this.matchmaker.on(MatchmakingEvent.MATCH_FOUND, (match) => {
+                console.log('Match found:', match);
+            });
+
+            this.matchmaker.on(MatchmakingEvent.PEER_JOINED, (peer) => {
+                console.log('Peer joined match:', peer);
+            });
 
             console.log('PigeonMatch initialized');
 
@@ -78,24 +94,14 @@ export class NetworkManager {
         try {
             console.log(`Joining world: ${this.worldId}`);
             
-            // Use PigeonMatch to find or create a world session
-            const session = await this.matcher.findOrCreateSession({
-                sessionId: this.worldId,
-                maxPlayers: 100,
-                metadata: {
-                    type: 'open-world',
-                    version: '1.0.0'
-                }
-            });
-
-            console.log('Joined world session:', session);
-            
-            // Announce presence to other peers
+            // Announce presence to other peers in the mesh
             this.broadcast({
                 type: 'player-join',
                 peerId: this.peerId,
                 timestamp: Date.now()
             });
+
+            console.log('Joined world successfully');
         } catch (error) {
             console.error('Failed to join world:', error);
         }
@@ -222,11 +228,11 @@ export class NetworkManager {
     /**
      * Broadcast message to all peers
      */
-    broadcast(message) {
+    async broadcast(message) {
         if (!this.mesh || !this.connected) return;
 
         try {
-            this.mesh.broadcast(JSON.stringify(message));
+            await this.mesh.sendMessage(JSON.stringify(message));
         } catch (error) {
             console.error('Failed to broadcast message:', error);
         }
@@ -284,8 +290,8 @@ export class NetworkManager {
         });
 
         // Cleanup
-        if (this.matcher) {
-            await this.matcher.leave();
+        if (this.matchmaker) {
+            this.matchmaker.destroy();
         }
 
         if (this.mesh) {

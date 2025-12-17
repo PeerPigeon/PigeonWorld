@@ -1,13 +1,23 @@
 import { defineConfig } from 'vite';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      'pigeonmatch': path.resolve(__dirname, 'node_modules/pigeonmatch/dist/pigeonmatch.es.js'),
+      'peerpigeon': path.resolve(__dirname, 'node_modules/peerpigeon/index.js')
+    }
+  },
   build: {
     target: 'esnext',
     rollupOptions: {
       output: {
         manualChunks: {
-          'peerpigeon': ['peerpigeon'],
-          'pigeonmatch': ['pigeonmatch']
+          'peerpigeon': ['peerpigeon']
         }
       }
     }
@@ -17,6 +27,9 @@ export default defineConfig({
     host: true
   },
   optimizeDeps: {
-    include: ['peerpigeon', 'pigeonmatch']
+    include: ['peerpigeon', 'pigeonmatch'],
+    esbuildOptions: {
+      target: 'esnext'
+    }
   }
 });

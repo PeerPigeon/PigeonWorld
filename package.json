@@ -9,14 +9,23 @@
     "build": "vite build",
     "preview": "vite preview"
   },
-  "keywords": ["game", "p2p", "procedural", "open-world", "peerpigeon", "multiplayer"],
+  "keywords": [
+    "game",
+    "p2p",
+    "procedural",
+    "open-world",
+    "peerpigeon",
+    "multiplayer"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "eventemitter3": "^5.0.1",
     "peerpigeon": "^1.1.3",
     "pigeonmatch": "^1.0.3"
   },
   "devDependencies": {
+    "@rollup/plugin-node-resolve": "^16.0.3",
     "vite": "^7.3.0"
   }
 }
