@@ -8,7 +8,7 @@ export class WorldGenerator {
         this.chunkSize = 32; // 32x32 tiles per chunk
         this.tileSize = 32; // pixels per tile
         this.biomes = {
-            WATER: { color: '#2196F3', height: 0.3 },
+            WATER: { color: '#1565C0', height: 0.3 }, // Darker blue to distinguish from sky
             SAND: { color: '#FFC107', height: 0.4 },
             GRASS: { color: '#4CAF50', height: 0.6 },
             FOREST: { color: '#2E7D32', height: 0.75 },
