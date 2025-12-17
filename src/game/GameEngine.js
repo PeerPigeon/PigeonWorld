@@ -473,10 +473,10 @@ export class GameEngine {
         }
         
         // Look ahead in the direction the player is facing, tilted down to see ground
-        // Camera is at player.y + 1.6, so lookAt needs to be BELOW camera height
+        // Camera is at player.y + 1.6, so lookAt needs to be SIGNIFICANTLY BELOW camera height
         const lookAtPoint = new THREE.Vector3(
             this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
-            this.player.y - 3, // Look down to see ground (below camera at player.y + 1.6)
+            this.player.y - 8, // Look down significantly to ensure ground is visible
             this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
