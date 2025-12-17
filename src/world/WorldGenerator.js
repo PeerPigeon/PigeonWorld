@@ -175,14 +175,27 @@ export class WorldGenerator {
 
     /**
      * Get tile at world coordinates
+     * Note: This method generates terrain on-the-fly for single tile queries.
+     * For rendering, use the chunk cache in GameEngine instead.
      */
     getTileAt(worldX, worldY) {
         const chunkX = Math.floor(worldX / this.chunkSize);
         const chunkY = Math.floor(worldY / this.chunkSize);
-        const localX = worldX - chunkX * this.chunkSize;
-        const localY = worldY - chunkY * this.chunkSize;
+        const localX = Math.floor(worldX - chunkX * this.chunkSize);
+        const localY = Math.floor(worldY - chunkY * this.chunkSize);
 
-        const chunk = this.generateChunk(chunkX, chunkY);
-        return chunk.tiles[localY][localX];
+        // Generate height on the fly for collision detection
+        const height = this.fractalNoise(worldX, worldY);
+        const biome = this.getBiome(height);
+
+        return {
+            x: worldX,
+            y: worldY,
+            height,
+            biome: biome.name,
+            color: biome.color,
+            walkable: biome.name !== 'WATER',
+            variation: this.random(worldX, worldY) * 0.2 - 0.1
+        };
     }
 }

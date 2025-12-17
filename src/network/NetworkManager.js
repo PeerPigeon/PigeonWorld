@@ -84,7 +84,7 @@ export class NetworkManager {
      * Generate a unique peer ID
      */
     generatePeerId() {
-        return 'player-' + Math.random().toString(36).substr(2, 9);
+        return 'player-' + Math.random().toString(36).substring(2, 11);
     }
 
     /**

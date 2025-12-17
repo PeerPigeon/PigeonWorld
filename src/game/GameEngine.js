@@ -40,6 +40,7 @@ export class GameEngine {
         // Input state
         this.keys = {};
         this.lastUpdate = Date.now();
+        this.lastNetworkUpdate = Date.now();
 
         // UI update callbacks
         this.uiCallbacks = {
@@ -162,7 +163,7 @@ export class GameEngine {
         this.lastUpdate = now;
 
         // Update game state
-        this.update(deltaTime);
+        this.update(deltaTime, now);
 
         // Render
         this.render();
@@ -174,7 +175,7 @@ export class GameEngine {
     /**
      * Update game state
      */
-    update(deltaTime) {
+    update(deltaTime, now) {
         // Update player movement
         this.updatePlayer(deltaTime);
 
@@ -184,9 +185,11 @@ export class GameEngine {
         // Update visible chunks
         this.updateVisibleChunks();
 
-        // Send player update to network (throttled)
-        if (deltaTime > 50) { // ~20 updates per second
+        // Send player update to network (throttled to ~20 updates per second)
+        const timeSinceLastNetworkUpdate = now - this.lastNetworkUpdate;
+        if (timeSinceLastNetworkUpdate > 50) {
             this.network.sendPlayerUpdate(this.player);
+            this.lastNetworkUpdate = now;
         }
 
         // Update UI
