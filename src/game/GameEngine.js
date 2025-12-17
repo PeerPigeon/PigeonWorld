@@ -472,11 +472,11 @@ export class GameEngine {
             this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
         }
         
-        // Look ahead at horizon level - camera looks straight ahead, not down
-        // This creates a sea/horizon view where sky meets ground naturally
+        // Look ahead with slight downward tilt to see immediate ground
+        // Camera at player.y + 1.6, lookAt slightly below to show ground in lower screen
         const lookAtPoint = new THREE.Vector3(
             this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
-            this.player.y + this.cameraOffset.y, // Same height as camera = horizon level view
+            this.player.y - 1, // Slight downward tilt to see ground immediately ahead
             this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
