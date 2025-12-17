@@ -1,32 +1,39 @@
+import * as THREE from 'three';
 import { WorldGenerator } from '../world/WorldGenerator.js';
 import { NetworkManager } from '../network/NetworkManager.js';
 
 /**
- * Main game engine
- * Handles rendering, player movement, and game loop
+ * Main game engine - 3D Version
+ * Handles rendering, player movement, and game loop using Three.js
  */
 export class GameEngine {
     constructor(canvas) {
         this.canvas = canvas;
-        this.ctx = canvas.getContext('2d');
         this.worldGen = new WorldGenerator();
         this.network = new NetworkManager();
         
-        // Camera
-        this.camera = {
-            x: 0,
-            y: 0,
-            zoom: 1
-        };
+        // Three.js setup
+        this.scene = null;
+        this.camera = null;
+        this.renderer = null;
+        this.playerMesh = null;
+        this.remoteMeshes = new Map();
+        
+        // Camera offset for third-person view
+        this.cameraOffset = new THREE.Vector3(0, 50, 50);
+        this.cameraLookAtOffset = new THREE.Vector3(0, 0, 0);
 
         // Local player
         this.player = {
             x: 0,
-            y: 0,
+            y: 10,
+            z: 0,
             vx: 0,
             vy: 0,
-            speed: 0.15,
-            size: 20,
+            vz: 0,
+            speed: 0.2,
+            rotation: 0,
+            size: 2,
             color: '#FF5722'
         };
 
@@ -60,14 +67,16 @@ export class GameEngine {
      * Initialize the game
      */
     async init() {
-        console.log('Initializing game engine...');
+        console.log('Initializing 3D game engine...');
 
-        // Set up canvas
-        this.resizeCanvas();
-        window.addEventListener('resize', () => this.resizeCanvas());
+        // Initialize Three.js
+        this.initThreeJS();
 
         // Set up input handlers
         this.setupInputHandlers();
+
+        // Generate initial world
+        this.generateWorld();
 
         // Initialize network
         const networkSuccess = await this.network.init();
@@ -82,12 +91,208 @@ export class GameEngine {
             this.updateUI('status', 'Offline Mode');
         }
 
-        // Set initial camera position
-        this.camera.x = this.player.x;
-        this.camera.y = this.player.y;
-
         this.initialized = true;
-        console.log('Game engine initialized');
+        console.log('3D game engine initialized');
+    }
+
+    /**
+     * Initialize Three.js scene, camera, and renderer
+     */
+    initThreeJS() {
+        // Create scene
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x87CEEB); // Sky blue
+        this.scene.fog = new THREE.Fog(0x87CEEB, 50, 200);
+
+        // Create camera
+        this.camera = new THREE.PerspectiveCamera(
+            60,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+        this.camera.position.set(0, 30, 40);
+        this.camera.lookAt(0, 0, 0);
+
+        // Create renderer
+        this.renderer = new THREE.WebGLRenderer({ 
+            canvas: this.canvas,
+            antialias: true 
+        });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // Add lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        this.scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(50, 100, 50);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.camera.left = -100;
+        directionalLight.shadow.camera.right = 100;
+        directionalLight.shadow.camera.top = 100;
+        directionalLight.shadow.camera.bottom = -100;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        this.scene.add(directionalLight);
+
+        // Create player mesh
+        const playerGeometry = new THREE.CapsuleGeometry(this.player.size / 2, this.player.size, 8, 16);
+        const playerMaterial = new THREE.MeshStandardMaterial({ 
+            color: this.player.color,
+            metalness: 0.3,
+            roughness: 0.7
+        });
+        this.playerMesh = new THREE.Mesh(playerGeometry, playerMaterial);
+        this.playerMesh.castShadow = true;
+        this.playerMesh.receiveShadow = true;
+        this.playerMesh.position.set(this.player.x, this.player.y, this.player.z);
+        this.scene.add(this.playerMesh);
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            this.camera.aspect = window.innerWidth / window.innerHeight;
+            this.camera.updateProjectionMatrix();
+            this.renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    }
+
+    /**
+     * Generate the 3D world
+     */
+    generateWorld() {
+        const viewDistance = 2; // Reduced for performance
+        const chunkSize = this.worldGen.chunkSize;
+
+        console.log('Generating 3D world with viewDistance:', viewDistance);
+
+        for (let chunkZ = -viewDistance; chunkZ <= viewDistance; chunkZ++) {
+            for (let chunkX = -viewDistance; chunkX <= viewDistance; chunkX++) {
+                const chunkKey = `${chunkX},${chunkZ}`;
+                const chunk = this.worldGen.generateChunk(chunkX, chunkZ);
+                this.chunks.set(chunkKey, chunk);
+                this.addChunkToScene(chunk);
+            }
+        }
+        
+        console.log('Generated', this.chunks.size, 'chunks. Scene has', this.scene.children.length, 'children');
+    }
+
+    /**
+     * Add a chunk's terrain to the Three.js scene
+     */
+    addChunkToScene(chunk) {
+        const chunkSize = this.worldGen.chunkSize;
+        const tileSize = 1; // Use 1 unit per tile for better scale in 3D
+
+        // Create geometry for the terrain
+        const geometry = new THREE.BufferGeometry();
+        const vertices = [];
+        const colors = [];
+        const indices = [];
+
+        for (let z = 0; z < chunkSize; z++) {
+            for (let x = 0; x < chunkSize; x++) {
+                const tile = chunk.tiles[z][x];
+                const worldX = (chunk.x * chunkSize + x) * tileSize;
+                const worldZ = (chunk.z * chunkSize + z) * tileSize;
+                const height = tile.height * 10; // Scale height to 0-10 range
+
+                // Get color from biome
+                const color = new THREE.Color(tile.color);
+
+                // Create quad vertices (two triangles per tile)
+                const x0 = worldX;
+                const x1 = worldX + tileSize;
+                const z0 = worldZ;
+                const z1 = worldZ + tileSize;
+
+                const idx = vertices.length / 3;
+
+                // Four corners
+                vertices.push(x0, height, z0);
+                vertices.push(x1, height, z0);
+                vertices.push(x1, height, z1);
+                vertices.push(x0, height, z1);
+
+                // Colors for each vertex
+                for (let i = 0; i < 4; i++) {
+                    colors.push(color.r, color.g, color.b);
+                }
+
+                // Two triangles
+                indices.push(idx, idx + 1, idx + 2);
+                indices.push(idx, idx + 2, idx + 3);
+            }
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        geometry.setIndex(indices);
+        geometry.computeVertexNormals();
+
+        const material = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            flatShading: true,
+            metalness: 0.2,
+            roughness: 0.8
+        });
+
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.receiveShadow = true;
+        mesh.userData.chunkKey = `${chunk.x},${chunk.z}`;
+        this.scene.add(mesh);
+
+        // Add entities (trees, rocks, etc.)
+        this.addEntitiesToScene(chunk);
+    }
+
+    /**
+     * Add entities like trees and rocks to the scene
+     */
+    addEntitiesToScene(chunk) {
+        const tileSize = 1; // Match terrain scale
+        const chunkSize = this.worldGen.chunkSize;
+
+        for (const entity of chunk.entities) {
+            const worldX = entity.x * tileSize;
+            const worldZ = entity.y * tileSize;
+            
+            // Get height at this position
+            const localX = entity.x - chunk.x * chunkSize;
+            const localZ = entity.y - chunk.z * chunkSize;
+            const tile = chunk.tiles[localZ][localX];
+            const height = tile.height * 10; // Match terrain height scale
+
+            let geometry, material;
+
+            // Simplified rendering - only add 20% of entities for performance
+            if (Math.random() > 0.8) {
+                if (entity.type === 'tree') {
+                    // Simpler tree representation
+                    const treeGeom = new THREE.ConeGeometry(2, 5, 6);
+                    const treeMat = new THREE.MeshStandardMaterial({ color: entity.color });
+                    const tree = new THREE.Mesh(treeGeom, treeMat);
+                    tree.position.set(worldX, height + 2.5, worldZ);
+                    tree.castShadow = true;
+                    this.scene.add(tree);
+
+                } else if (entity.type === 'rock') {
+                    geometry = new THREE.BoxGeometry(entity.size * 2, entity.size * 2, entity.size * 2);
+                    material = new THREE.MeshStandardMaterial({ 
+                        color: entity.color,
+                        metalness: 0.5,
+                        roughness: 0.9
+                    });
+                    const mesh = new THREE.Mesh(geometry, material);
+                    mesh.position.set(worldX, height + entity.size, worldZ);
+                    mesh.castShadow = true;
+                    this.scene.add(mesh);
+                }
+            }
+        }
     }
 
     /**
@@ -115,14 +320,6 @@ export class GameEngine {
         this.network.on('peer-disconnected', () => {
             this.updateUI('peers', this.network.getPeerCount());
         });
-    }
-
-    /**
-     * Resize canvas to fit window
-     */
-    resizeCanvas() {
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
     }
 
     /**
@@ -182,8 +379,8 @@ export class GameEngine {
         // Update camera
         this.updateCamera();
 
-        // Update visible chunks
-        this.updateVisibleChunks();
+        // Update remote players
+        this.updateRemotePlayers();
 
         // Send player update to network (throttled to ~20 updates per second)
         const timeSinceLastNetworkUpdate = now - this.lastNetworkUpdate;
@@ -193,211 +390,131 @@ export class GameEngine {
         }
 
         // Update UI
-        this.updateUI('position', `${Math.floor(this.player.x)}, ${Math.floor(this.player.y)}`);
-        const chunkX = Math.floor(this.player.x / this.worldGen.chunkSize);
-        const chunkY = Math.floor(this.player.y / this.worldGen.chunkSize);
-        this.updateUI('chunk', `${chunkX}, ${chunkY}`);
+        this.updateUI('position', `${Math.floor(this.player.x)}, ${Math.floor(this.player.z)}`);
+        const chunkX = Math.floor(this.player.x / (this.worldGen.chunkSize * this.worldGen.tileSize));
+        const chunkZ = Math.floor(this.player.z / (this.worldGen.chunkSize * this.worldGen.tileSize));
+        this.updateUI('chunk', `${chunkX}, ${chunkZ}`);
     }
 
     /**
-     * Update player position based on input
+     * Update player position based on input - 3D version
      */
     updatePlayer(deltaTime) {
         const speed = this.player.speed * deltaTime;
 
         // Reset velocity
         this.player.vx = 0;
-        this.player.vy = 0;
+        this.player.vz = 0;
 
-        // WASD movement
-        if (this.keys['w'] || this.keys['arrowup']) this.player.vy -= speed;
-        if (this.keys['s'] || this.keys['arrowdown']) this.player.vy += speed;
+        // WASD movement in 3D space
+        if (this.keys['w'] || this.keys['arrowup']) this.player.vz -= speed;
+        if (this.keys['s'] || this.keys['arrowdown']) this.player.vz += speed;
         if (this.keys['a'] || this.keys['arrowleft']) this.player.vx -= speed;
         if (this.keys['d'] || this.keys['arrowright']) this.player.vx += speed;
 
         // Normalize diagonal movement
-        if (this.player.vx !== 0 && this.player.vy !== 0) {
-            const magnitude = Math.sqrt(this.player.vx * this.player.vx + this.player.vy * this.player.vy);
+        if (this.player.vx !== 0 && this.player.vz !== 0) {
+            const magnitude = Math.sqrt(this.player.vx * this.player.vx + this.player.vz * this.player.vz);
             this.player.vx = (this.player.vx / magnitude) * speed;
-            this.player.vy = (this.player.vy / magnitude) * speed;
+            this.player.vz = (this.player.vz / magnitude) * speed;
         }
 
         // Update position
         const newX = this.player.x + this.player.vx;
-        const newY = this.player.y + this.player.vy;
+        const newZ = this.player.z + this.player.vz;
 
-        // Check if new position is walkable
-        const tile = this.worldGen.getTileAt(Math.floor(newX), Math.floor(newY));
+        // Check if new position is walkable and update height
+        const tile = this.worldGen.getTileAt(
+            Math.floor(newX), 
+            Math.floor(newZ)
+        );
+        
         if (tile && tile.walkable) {
             this.player.x = newX;
-            this.player.y = newY;
+            this.player.z = newZ;
+            // Set player height based on terrain (match terrain scale)
+            this.player.y = tile.height * 10 + this.player.size;
+        }
+
+        // Update player mesh position
+        if (this.playerMesh) {
+            this.playerMesh.position.set(this.player.x, this.player.y, this.player.z);
+            
+            // Rotate player mesh based on movement direction
+            if (this.player.vx !== 0 || this.player.vz !== 0) {
+                this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
+                this.playerMesh.rotation.y = this.player.rotation;
+            }
         }
     }
 
     /**
-     * Update camera to follow player
+     * Update camera to follow player in 3D
      */
     updateCamera() {
         const smoothing = 0.1;
-        this.camera.x += (this.player.x - this.camera.x) * smoothing;
-        this.camera.y += (this.player.y - this.camera.y) * smoothing;
+        
+        // Calculate desired camera position (behind and above player)
+        const targetX = this.player.x + this.cameraOffset.x;
+        const targetY = this.player.y + this.cameraOffset.y;
+        const targetZ = this.player.z + this.cameraOffset.z;
+        
+        // Smooth camera movement
+        this.camera.position.x += (targetX - this.camera.position.x) * smoothing;
+        this.camera.position.y += (targetY - this.camera.position.y) * smoothing;
+        this.camera.position.z += (targetZ - this.camera.position.z) * smoothing;
+        
+        // Look at player position
+        const lookAtPoint = new THREE.Vector3(
+            this.player.x,
+            this.player.y + this.cameraLookAtOffset.y,
+            this.player.z
+        );
+        this.camera.lookAt(lookAtPoint);
     }
 
     /**
-     * Update which chunks are visible
+     * Update remote player meshes
      */
-    updateVisibleChunks() {
-        this.visibleChunks.clear();
-
-        const viewDistance = 2; // chunks in each direction
-        const centerChunkX = Math.floor(this.camera.x / this.worldGen.chunkSize);
-        const centerChunkY = Math.floor(this.camera.y / this.worldGen.chunkSize);
-
-        for (let dy = -viewDistance; dy <= viewDistance; dy++) {
-            for (let dx = -viewDistance; dx <= viewDistance; dx++) {
-                const chunkX = centerChunkX + dx;
-                const chunkY = centerChunkY + dy;
-                const chunkKey = `${chunkX},${chunkY}`;
-
-                this.visibleChunks.add(chunkKey);
-
-                // Generate chunk if not cached
-                if (!this.chunks.has(chunkKey)) {
-                    this.chunks.set(chunkKey, this.worldGen.generateChunk(chunkX, chunkY));
-                }
+    updateRemotePlayers() {
+        // Update existing remote player meshes
+        for (const [peerId, player] of this.remotePlayers.entries()) {
+            if (!this.remoteMeshes.has(peerId)) {
+                // Create new mesh for remote player
+                const geometry = new THREE.CapsuleGeometry(1, 2, 8, 16);
+                const material = new THREE.MeshStandardMaterial({ 
+                    color: '#2196F3',
+                    metalness: 0.3,
+                    roughness: 0.7
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                this.scene.add(mesh);
+                this.remoteMeshes.set(peerId, mesh);
+            }
+            
+            const mesh = this.remoteMeshes.get(peerId);
+            mesh.position.set(player.x || 0, player.y || 5, player.z || 0);
+        }
+        
+        // Remove meshes for disconnected players
+        for (const [peerId, mesh] of this.remoteMeshes.entries()) {
+            if (!this.remotePlayers.has(peerId)) {
+                this.scene.remove(mesh);
+                this.remoteMeshes.delete(peerId);
             }
         }
     }
 
     /**
-     * Render the game
+     * Render the game using Three.js
      */
     render() {
-        // Clear canvas
-        this.ctx.fillStyle = '#0a0a0a';
-        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-
-        const tileSize = this.worldGen.tileSize * this.camera.zoom;
-        const offsetX = this.canvas.width / 2 - this.camera.x * tileSize;
-        const offsetY = this.canvas.height / 2 - this.camera.y * tileSize;
-
-        // Render visible chunks
-        for (const chunkKey of this.visibleChunks) {
-            const chunk = this.chunks.get(chunkKey);
-            if (!chunk) continue;
-
-            this.renderChunk(chunk, offsetX, offsetY, tileSize);
-        }
-
-        // Render remote players
-        for (const player of this.remotePlayers.values()) {
-            this.renderPlayer(player, offsetX, offsetY, tileSize, '#2196F3');
-        }
-
-        // Render local player
-        this.renderPlayer(this.player, offsetX, offsetY, tileSize, this.player.color);
+        this.renderer.render(this.scene, this.camera);
     }
 
-    /**
-     * Render a chunk
-     */
-    renderChunk(chunk, offsetX, offsetY, tileSize) {
-        for (let y = 0; y < this.worldGen.chunkSize; y++) {
-            for (let x = 0; x < this.worldGen.chunkSize; x++) {
-                const tile = chunk.tiles[y][x];
-                const screenX = offsetX + tile.x * tileSize;
-                const screenY = offsetY + tile.y * tileSize;
 
-                // Skip if off screen
-                if (screenX < -tileSize || screenX > this.canvas.width ||
-                    screenY < -tileSize || screenY > this.canvas.height) {
-                    continue;
-                }
-
-                // Draw tile
-                this.ctx.fillStyle = tile.color;
-                this.ctx.fillRect(screenX, screenY, tileSize, tileSize);
-
-                // Add subtle border
-                this.ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
-                this.ctx.strokeRect(screenX, screenY, tileSize, tileSize);
-            }
-        }
-
-        // Render entities
-        for (const entity of chunk.entities) {
-            const screenX = offsetX + entity.x * tileSize;
-            const screenY = offsetY + entity.y * tileSize;
-
-            if (screenX < -tileSize || screenX > this.canvas.width ||
-                screenY < -tileSize || screenY > this.canvas.height) {
-                continue;
-            }
-
-            this.renderEntity(entity, screenX, screenY, tileSize);
-        }
-    }
-
-    /**
-     * Render an entity (tree, rock, etc.)
-     */
-    renderEntity(entity, x, y, tileSize) {
-        const size = tileSize * entity.size;
-        const centerX = x + tileSize / 2;
-        const centerY = y + tileSize / 2;
-
-        this.ctx.fillStyle = entity.color;
-        
-        if (entity.type === 'tree') {
-            // Draw tree
-            this.ctx.beginPath();
-            this.ctx.arc(centerX, centerY, size / 2, 0, Math.PI * 2);
-            this.ctx.fill();
-        } else if (entity.type === 'rock') {
-            // Draw rock
-            this.ctx.fillRect(centerX - size / 2, centerY - size / 2, size, size);
-        } else {
-            // Default circle
-            this.ctx.beginPath();
-            this.ctx.arc(centerX, centerY, size / 2, 0, Math.PI * 2);
-            this.ctx.fill();
-        }
-    }
-
-    /**
-     * Render a player
-     */
-    renderPlayer(player, offsetX, offsetY, tileSize, color) {
-        const screenX = offsetX + player.x * tileSize;
-        const screenY = offsetY + player.y * tileSize;
-
-        // Draw player circle
-        this.ctx.fillStyle = color;
-        this.ctx.beginPath();
-        this.ctx.arc(screenX, screenY, player.size * this.camera.zoom, 0, Math.PI * 2);
-        this.ctx.fill();
-
-        // Draw player outline
-        this.ctx.strokeStyle = '#FFF';
-        this.ctx.lineWidth = 2;
-        this.ctx.stroke();
-
-        // Draw direction indicator
-        if (player.vx !== 0 || player.vy !== 0) {
-            const angle = Math.atan2(player.vy, player.vx);
-            const indicatorLength = player.size * this.camera.zoom * 1.5;
-            
-            this.ctx.strokeStyle = color;
-            this.ctx.lineWidth = 3;
-            this.ctx.beginPath();
-            this.ctx.moveTo(screenX, screenY);
-            this.ctx.lineTo(
-                screenX + Math.cos(angle) * indicatorLength,
-                screenY + Math.sin(angle) * indicatorLength
-            );
-            this.ctx.stroke();
-        }
-    }
 
     /**
      * Set UI update callback

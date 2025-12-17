@@ -82,35 +82,35 @@ export class WorldGenerator {
     }
 
     /**
-     * Generate a chunk at given coordinates
+     * Generate a chunk at given coordinates (3D version - x and z)
      */
-    generateChunk(chunkX, chunkY) {
+    generateChunk(chunkX, chunkZ) {
         const chunk = {
             x: chunkX,
-            y: chunkY,
+            z: chunkZ,
             tiles: [],
             entities: []
         };
 
         const startX = chunkX * this.chunkSize;
-        const startY = chunkY * this.chunkSize;
+        const startZ = chunkZ * this.chunkSize;
 
-        for (let localY = 0; localY < this.chunkSize; localY++) {
+        for (let localZ = 0; localZ < this.chunkSize; localZ++) {
             const row = [];
             for (let localX = 0; localX < this.chunkSize; localX++) {
                 const worldX = startX + localX;
-                const worldY = startY + localY;
+                const worldZ = startZ + localZ;
                 
                 // Generate height map
-                const height = this.fractalNoise(worldX, worldY);
+                const height = this.fractalNoise(worldX, worldZ);
                 const biome = this.getBiome(height);
 
                 // Add some variation
-                const variation = this.random(worldX, worldY) * 0.2 - 0.1;
+                const variation = this.random(worldX, worldZ) * 0.2 - 0.1;
 
                 row.push({
                     x: worldX,
-                    y: worldY,
+                    y: worldZ, // Keep y for compatibility with entity placement
                     height,
                     biome: biome.name,
                     color: biome.color,
