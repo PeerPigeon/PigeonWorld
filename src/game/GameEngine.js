@@ -472,10 +472,10 @@ export class GameEngine {
             this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
         }
         
-        // Look ahead in the direction the player is facing
+        // Look ahead in the direction the player is facing, tilted down to see ground
         const lookAtPoint = new THREE.Vector3(
             this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
-            this.player.y + this.cameraOffset.y,
+            this.player.y - 2, // Look down to see the ground
             this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
