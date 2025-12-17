@@ -1,12 +1,13 @@
 # PigeonWorld
 
-A procedural open world multiplayer game built with **PeerPigeon** and **PigeonMatch**.
+A procedural open world multiplayer game built with **Three.js**, **PeerPigeon** and **PigeonMatch**.
 
 ## Overview
 
-PigeonWorld is a browser-based, peer-to-peer multiplayer open world game featuring:
+PigeonWorld is a browser-based, peer-to-peer multiplayer **3D** open world game featuring:
 
-- 🌍 **Procedural World Generation** - Infinite terrain with biomes (water, grass, forest, mountains, etc.)
+- 🌍 **3D Procedural World** - Infinite terrain with height variation and biomes (water, grass, forest, mountains, etc.)
+- 🎨 **Three.js Rendering** - WebGL-powered 3D graphics with lighting and shadows
 - 🎮 **P2P Multiplayer** - Connect with other players through WebRTC mesh networking
 - 🔗 **Decentralized** - No central game server required, powered by PeerPigeon
 - 🎯 **Matchmaking** - Find and join other players using PigeonMatch
@@ -14,23 +15,31 @@ PigeonWorld is a browser-based, peer-to-peer multiplayer open world game featuri
 
 ## Features
 
+### 3D Graphics
+- WebGL rendering via Three.js
+- PerspectiveCamera with third-person view
+- Dynamic lighting with shadows
+- PBR materials (Physically Based Rendering)
+- Sky dome with atmospheric fog
+
 ### World Generation
-- Procedural terrain using fractal noise algorithms
-- Multiple biomes: Water, Sand, Grass, Forest, Mountain, Snow
+- Procedural 3D terrain using fractal noise algorithms
+- Multiple biomes with height variation: Water, Sand, Grass, Forest, Mountain, Snow
 - Chunk-based rendering for optimal performance
-- Randomly placed entities (trees, rocks, bushes)
+- 3D entities (trees as cones, rocks as boxes)
+- Vertex-colored terrain meshes
 
 ### Multiplayer
 - True peer-to-peer networking with PeerPigeon mesh
 - Automatic peer discovery and connection management
-- Player state synchronization
+- Player state synchronization in 3D space
 - Support for up to 100 players per world instance
 
 ### Gameplay
-- Explore an infinite procedural world
-- See other players in real-time
-- Smooth camera following
-- Collision detection with terrain
+- Explore an infinite procedural 3D world
+- See other players in real-time as 3D avatars
+- Smooth third-person camera following
+- Terrain collision detection with height adaptation
 
 ## Getting Started
 
@@ -96,10 +105,10 @@ The built files will be in the `dist` directory.
 
 ### Technology Stack
 
+- **Three.js** - 3D WebGL rendering engine
 - **PeerPigeon** - WebRTC-based P2P mesh networking
 - **PigeonMatch** - Matchmaking and collaboration engine
 - **Vite** - Build tool and dev server
-- **HTML5 Canvas** - 2D rendering
 
 ## Network Architecture
 

@@ -166,7 +166,7 @@ export class GameEngine {
         const viewDistance = 2; // Reduced for performance
         const chunkSize = this.worldGen.chunkSize;
 
-        console.log('Generating 3D world with viewDistance:', viewDistance);
+
 
         for (let chunkZ = -viewDistance; chunkZ <= viewDistance; chunkZ++) {
             for (let chunkX = -viewDistance; chunkX <= viewDistance; chunkX++) {
@@ -177,7 +177,7 @@ export class GameEngine {
             }
         }
         
-        console.log('Generated', this.chunks.size, 'chunks. Scene has', this.scene.children.length, 'children');
+
     }
 
     /**
