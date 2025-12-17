@@ -1,0 +1,22 @@
+{
+  "name": "pigeonworld",
+  "version": "1.0.0",
+  "description": "A procedural open world game built with PeerPigeon and PigeonMatch",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": ["game", "p2p", "procedural", "open-world", "peerpigeon", "multiplayer"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "peerpigeon": "^1.1.3",
+    "pigeonmatch": "^1.0.3"
+  },
+  "devDependencies": {
+    "vite": "^7.3.0"
+  }
+}
