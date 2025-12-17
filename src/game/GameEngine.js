@@ -19,9 +19,9 @@ export class GameEngine {
         this.playerMesh = null;
         this.remoteMeshes = new Map();
         
-        // Camera offset for third-person view
-        this.cameraOffset = new THREE.Vector3(0, 50, 50);
-        this.cameraLookAtOffset = new THREE.Vector3(0, 0, 0);
+        // Camera settings for first-person view
+        this.cameraOffset = new THREE.Vector3(0, 1.6, 0); // Eye level height
+        this.cameraLookAtDistance = 10; // Look ahead distance
 
         // Local player
         this.player = {
@@ -149,6 +149,8 @@ export class GameEngine {
         this.playerMesh.castShadow = true;
         this.playerMesh.receiveShadow = true;
         this.playerMesh.position.set(this.player.x, this.player.y, this.player.z);
+        // Hide player mesh in first-person view
+        this.playerMesh.visible = false;
         this.scene.add(this.playerMesh);
 
         // Handle window resize
@@ -449,12 +451,12 @@ export class GameEngine {
     }
 
     /**
-     * Update camera to follow player in 3D
+     * Update camera to follow player - First-person view
      */
     updateCamera() {
-        const smoothing = 0.1;
+        const smoothing = 0.2;
         
-        // Calculate desired camera position (behind and above player)
+        // Position camera at player's eye level
         const targetX = this.player.x + this.cameraOffset.x;
         const targetY = this.player.y + this.cameraOffset.y;
         const targetZ = this.player.z + this.cameraOffset.z;
@@ -464,11 +466,17 @@ export class GameEngine {
         this.camera.position.y += (targetY - this.camera.position.y) * smoothing;
         this.camera.position.z += (targetZ - this.camera.position.z) * smoothing;
         
-        // Look at player position
+        // Calculate look direction based on player rotation
+        // If player is moving, use movement direction; otherwise maintain current direction
+        if (this.player.vx !== 0 || this.player.vz !== 0) {
+            this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
+        }
+        
+        // Look ahead in the direction the player is facing
         const lookAtPoint = new THREE.Vector3(
-            this.player.x,
-            this.player.y + this.cameraLookAtOffset.y,
-            this.player.z
+            this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
+            this.player.y + this.cameraOffset.y,
+            this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
     }
