@@ -21,7 +21,7 @@ export class GameEngine {
         
         // Camera settings for first-person view
         this.cameraOffset = new THREE.Vector3(0, 1.6, 0); // Eye level height
-        this.cameraLookAtDistance = 10; // Look ahead distance
+        this.cameraLookAtDistance = 5; // Look ahead distance (reduced for better ground visibility)
 
         // Local player
         this.player = {
@@ -473,9 +473,10 @@ export class GameEngine {
         }
         
         // Look ahead in the direction the player is facing, tilted down to see ground
+        // Camera is at player.y + 1.6, so lookAt needs to be BELOW camera height
         const lookAtPoint = new THREE.Vector3(
             this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
-            this.player.y - 2, // Look down to see the ground
+            this.player.y - 3, // Look down to see ground (below camera at player.y + 1.6)
             this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
