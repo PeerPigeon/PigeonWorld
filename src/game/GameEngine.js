@@ -63,6 +63,26 @@ export class GameEngine {
         // Debug/telemetry
         this._shotsFired = 0;
 
+        // Audio (initialized on user gesture)
+        this.audioCtx = null;
+        this.audioMaster = null;
+        this._noiseBuffer = null;
+        this._gunIR = null;
+        this._gunConvolver = null;
+        this._audioUnlocked = false;
+        this.sfxEnabled = true;
+
+        // Footsteps
+        this.footstepIntervalMs = 360;
+        this._nextFootstepAt = 0;
+
+        // Tree sway on footsteps
+        this.treeSwayRadius = 14;
+        this.treeSwayMaxCount = 40;
+        this.treeSwayImpulse = 0.55;
+        this.treeSwayDecayPerSec = 2.4;
+        this._treeSway = new Map(); // mesh.uuid -> { mesh, amp }
+
         // Simple transient visual effects (tracers, flashes)
         this.effects = [];
 
@@ -289,6 +309,356 @@ export class GameEngine {
         document.body.appendChild(dot);
     }
 
+    ensureAudio() {
+        if (!this.sfxEnabled) return;
+        if (typeof window === 'undefined') return;
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+
+        if (!this.audioCtx) {
+            this.audioCtx = new Ctx();
+            this.audioMaster = this.audioCtx.createGain();
+            this.audioMaster.gain.value = 0.28;
+            this.audioMaster.connect(this.audioCtx.destination);
+        }
+
+        if (this.audioCtx.state === 'suspended') {
+            this.audioCtx.resume().catch(() => {});
+        }
+
+        // Safari/iOS quirk: sometimes audio won't output until a node has started.
+        if (!this._audioUnlocked && this.audioCtx.state === 'running') {
+            try {
+                const g = this.audioCtx.createGain();
+                g.gain.value = 0;
+                g.connect(this.audioMaster || this.audioCtx.destination);
+
+                const osc = this.audioCtx.createOscillator();
+                osc.frequency.value = 440;
+                osc.connect(g);
+                osc.start();
+                osc.stop(this.audioCtx.currentTime + 0.01);
+                this._audioUnlocked = true;
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    getNoiseBuffer() {
+        if (!this.audioCtx) return null;
+        if (this._noiseBuffer) return this._noiseBuffer;
+
+        const sampleRate = this.audioCtx.sampleRate;
+        const length = Math.floor(sampleRate * 0.2);
+        const buffer = this.audioCtx.createBuffer(1, length, sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < length; i++) {
+            const t = i / length;
+            const decay = Math.pow(1 - t, 2);
+            data[i] = (Math.random() * 2 - 1) * decay;
+        }
+        this._noiseBuffer = buffer;
+        return buffer;
+    }
+
+    getGunConvolver() {
+        if (!this.audioCtx) return null;
+        if (this._gunConvolver) return this._gunConvolver;
+
+        // Short, bright impulse response to give a tiny "room" tail.
+        if (!this._gunIR) {
+            const sr = this.audioCtx.sampleRate;
+            const seconds = 0.18;
+            const length = Math.max(1, Math.floor(sr * seconds));
+            const ir = this.audioCtx.createBuffer(2, length, sr);
+            for (let ch = 0; ch < 2; ch++) {
+                const data = ir.getChannelData(ch);
+                for (let i = 0; i < length; i++) {
+                    const t = i / length;
+                    // Fast decay with a slightly "grainy" tail
+                    const decay = Math.pow(1 - t, 4);
+                    const jitter = (Math.random() * 2 - 1);
+                    data[i] = jitter * decay * 0.6;
+                }
+            }
+            this._gunIR = ir;
+        }
+
+        const conv = this.audioCtx.createConvolver();
+        conv.buffer = this._gunIR;
+        this._gunConvolver = conv;
+        return conv;
+    }
+
+    playFootstepSound() {
+        if (!this.sfxEnabled) return;
+        this.ensureAudio();
+        if (!this.audioCtx || !this.audioMaster) return;
+
+        const t0 = this.audioCtx.currentTime;
+        const osc = this.audioCtx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(115, t0);
+        osc.frequency.exponentialRampToValueAtTime(70, t0 + 0.06);
+
+        const g = this.audioCtx.createGain();
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.35, t0 + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.11);
+
+        osc.connect(g);
+        g.connect(this.audioMaster);
+        osc.start(t0);
+        osc.stop(t0 + 0.12);
+
+        const noiseBuf = this.getNoiseBuffer();
+        if (noiseBuf) {
+            const noise = this.audioCtx.createBufferSource();
+            noise.buffer = noiseBuf;
+            const ng = this.audioCtx.createGain();
+            ng.gain.setValueAtTime(0.0001, t0);
+            ng.gain.exponentialRampToValueAtTime(0.08, t0 + 0.01);
+            ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
+            noise.connect(ng);
+            ng.connect(this.audioMaster);
+            noise.start(t0);
+            noise.stop(t0 + 0.09);
+        }
+    }
+
+    playShootSound() {
+        if (!this.sfxEnabled) return;
+        this.ensureAudio();
+        if (!this.audioCtx || !this.audioMaster) return;
+
+        const t0 = this.audioCtx.currentTime;
+
+        // Slight randomization so repeated shots don't sound identical.
+        const rand = () => (Math.random() * 2 - 1);
+        const pitchJitter = 1 + rand() * 0.04;
+        const panNode = (typeof this.audioCtx.createStereoPanner === 'function') ? this.audioCtx.createStereoPanner() : null;
+        if (panNode) {
+            panNode.pan.setValueAtTime(rand() * 0.18, t0);
+            panNode.connect(this.audioMaster);
+        }
+        const out = panNode || this.audioMaster;
+
+        // Fast transient: short click/crack
+        const crack = this.audioCtx.createOscillator();
+        crack.type = 'square';
+        crack.frequency.setValueAtTime(2400 * pitchJitter, t0);
+        crack.frequency.exponentialRampToValueAtTime(900 * pitchJitter, t0 + 0.008);
+        const crackGain = this.audioCtx.createGain();
+        crackGain.gain.setValueAtTime(0.0001, t0);
+        crackGain.gain.exponentialRampToValueAtTime(0.30, t0 + 0.001);
+        crackGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.018);
+        crack.connect(crackGain);
+        crackGain.connect(out);
+        crack.start(t0);
+        crack.stop(t0 + 0.02);
+
+        // Body: low thump
+        const thump = this.audioCtx.createOscillator();
+        thump.type = 'triangle';
+        thump.frequency.setValueAtTime(150 * pitchJitter, t0);
+        thump.frequency.exponentialRampToValueAtTime(52, t0 + 0.10);
+        const thumpGain = this.audioCtx.createGain();
+        thumpGain.gain.setValueAtTime(0.0001, t0);
+        thumpGain.gain.exponentialRampToValueAtTime(0.38, t0 + 0.004);
+        thumpGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.13);
+        thump.connect(thumpGain);
+        thumpGain.connect(out);
+        thump.start(t0);
+        thump.stop(t0 + 0.14);
+
+        // Blast: filtered noise + light saturation/compression
+        const noiseBuf = this.getNoiseBuffer();
+        if (noiseBuf) {
+            const noise = this.audioCtx.createBufferSource();
+            noise.buffer = noiseBuf;
+
+            const bp = this.audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.setValueAtTime(1900 * pitchJitter, t0);
+            bp.Q.setValueAtTime(0.9, t0);
+
+            const hp = this.audioCtx.createBiquadFilter();
+            hp.type = 'highpass';
+            hp.frequency.setValueAtTime(650, t0);
+
+            const drive = this.audioCtx.createWaveShaper();
+            const curve = new Float32Array(1024);
+            const driveAmt = 2.6;
+            for (let i = 0; i < curve.length; i++) {
+                const x = (i / (curve.length - 1)) * 2 - 1;
+                curve[i] = Math.tanh(driveAmt * x);
+            }
+            drive.curve = curve;
+            drive.oversample = '2x';
+
+            const comp = this.audioCtx.createDynamicsCompressor();
+            comp.threshold.setValueAtTime(-20, t0);
+            comp.knee.setValueAtTime(24, t0);
+            comp.ratio.setValueAtTime(10, t0);
+            comp.attack.setValueAtTime(0.002, t0);
+            comp.release.setValueAtTime(0.09, t0);
+
+            const g = this.audioCtx.createGain();
+            g.gain.setValueAtTime(0.0001, t0);
+            g.gain.exponentialRampToValueAtTime(0.75, t0 + 0.003);
+            g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.11);
+
+            // Optional short tail for "gunshot" feel
+            const wetGain = this.audioCtx.createGain();
+            wetGain.gain.setValueAtTime(0.10, t0);
+            const conv = this.getGunConvolver();
+
+            // Tiny slapback delay (very subtle)
+            const delay = this.audioCtx.createDelay(0.2);
+            delay.delayTime.setValueAtTime(0.045, t0);
+            const fb = this.audioCtx.createGain();
+            fb.gain.setValueAtTime(0.18, t0);
+            const tailLP = this.audioCtx.createBiquadFilter();
+            tailLP.type = 'lowpass';
+            tailLP.frequency.setValueAtTime(3200, t0);
+
+            noise.connect(bp);
+            bp.connect(hp);
+            hp.connect(drive);
+            drive.connect(comp);
+
+            // Dry
+            comp.connect(g);
+            g.connect(out);
+
+            // Wet (reverb + slap)
+            if (conv) {
+                comp.connect(conv);
+                conv.connect(wetGain);
+                wetGain.connect(out);
+            }
+            comp.connect(delay);
+            delay.connect(tailLP);
+            tailLP.connect(wetGain);
+            wetGain.connect(out);
+            tailLP.connect(fb);
+            fb.connect(delay);
+
+            noise.start(t0);
+            noise.stop(t0 + 0.12);
+        }
+
+    }
+
+    playDeathSound() {
+        if (!this.sfxEnabled) return;
+        this.ensureAudio();
+        if (!this.audioCtx || !this.audioMaster) return;
+
+        const t0 = this.audioCtx.currentTime;
+        const osc = this.audioCtx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(120, t0);
+        osc.frequency.exponentialRampToValueAtTime(45, t0 + 0.25);
+
+        const g = this.audioCtx.createGain();
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
+
+        osc.connect(g);
+        g.connect(this.audioMaster);
+        osc.start(t0);
+        osc.stop(t0 + 0.36);
+    }
+
+    updateFootsteps(nowMs) {
+        if (!this.player?.alive) return;
+        if (!this.player?.grounded) return;
+
+        const vx = this.player.vx || 0;
+        const vz = this.player.vz || 0;
+        const speed = Math.hypot(vx, vz);
+        if (speed < 0.02) return;
+
+        const interval = Math.max(220, this.footstepIntervalMs - Math.min(160, speed * 40));
+        if (nowMs < this._nextFootstepAt) return;
+        this._nextFootstepAt = nowMs + interval;
+
+        this.playFootstepSound();
+        this.triggerNearbyTreeSway(this.player.x, this.player.y, this.player.z);
+    }
+
+    triggerNearbyTreeSway(x, y, z) {
+        if (!this.chunkGroups || this.chunkGroups.size === 0) return;
+
+        const radius = this.treeSwayRadius;
+        const r2 = radius * radius;
+        let remaining = this.treeSwayMaxCount;
+
+        for (const group of this.chunkGroups.values()) {
+            if (!group) continue;
+            group.traverse((obj) => {
+                if (remaining <= 0) return;
+                if (!obj || !obj.isMesh) return;
+                if (obj.userData?.entityType !== 'tree') return;
+
+                const dx = obj.position.x - x;
+                const dz = obj.position.z - z;
+                const d2 = dx * dx + dz * dz;
+                if (d2 > r2) return;
+
+                const falloff = 1 - Math.min(1, Math.sqrt(d2) / radius);
+                const impulse = this.treeSwayImpulse * falloff;
+
+                const key = obj.uuid;
+                const existing = this._treeSway.get(key);
+                if (existing) {
+                    existing.amp = Math.min(1.2, existing.amp + impulse);
+                } else {
+                    this._treeSway.set(key, { mesh: obj, amp: impulse });
+                }
+                remaining--;
+            });
+            if (remaining <= 0) break;
+        }
+    }
+
+    updateTreeSway(deltaTimeMs) {
+        if (!this._treeSway || this._treeSway.size === 0) return;
+
+        const dt = Math.max(0, deltaTimeMs) / 1000;
+        const decay = Math.max(0, 1 - this.treeSwayDecayPerSec * dt);
+        const t = Date.now() / 1000;
+
+        for (const [key, s] of this._treeSway.entries()) {
+            const mesh = s?.mesh;
+            if (!mesh || !mesh.parent) {
+                this._treeSway.delete(key);
+                continue;
+            }
+
+            s.amp *= decay;
+            if (s.amp < 0.02) {
+                const base = mesh.userData?.baseRotation;
+                if (base) {
+                    mesh.rotation.x = base.x;
+                    mesh.rotation.y = base.y;
+                    mesh.rotation.z = base.z;
+                }
+                this._treeSway.delete(key);
+                continue;
+            }
+
+            const base = mesh.userData?.baseRotation || { x: 0, y: 0, z: 0 };
+            const w = 6.5;
+            const sway = Math.sin(t * w + (mesh.position.x + mesh.position.z) * 0.2) * (0.22 * s.amp);
+            mesh.rotation.z = base.z + sway;
+            mesh.rotation.x = base.x + sway * 0.35;
+        }
+    }
+
     /**
      * Generate the 3D world
      */
@@ -450,6 +820,8 @@ export class GameEngine {
                     const tree = new THREE.Mesh(treeGeom, treeMat);
                     tree.position.set(worldX, height + treeHeight / 2, worldZ);
                     tree.castShadow = true;
+                    tree.userData.entityType = 'tree';
+                    tree.userData.baseRotation = { x: tree.rotation.x, y: tree.rotation.y, z: tree.rotation.z };
                     parentGroup.add(tree);
 
                 } else if (entity.type === 'rock') {
@@ -685,10 +1057,17 @@ export class GameEngine {
         // Click-to-focus + pointer lock for natural mouse-look
         this.canvas.addEventListener('click', () => {
             this.canvas.focus?.();
+            this.ensureAudio();
             if (document.pointerLockElement !== this.canvas) {
                 this.canvas.requestPointerLock?.();
             }
         });
+
+        // Extra audio unlock paths for Safari/iOS (must be triggered by a user gesture)
+        const unlockAudio = () => this.ensureAudio();
+        window.addEventListener('pointerdown', unlockAudio, { passive: true });
+        window.addEventListener('touchstart', unlockAudio, { passive: true });
+        window.addEventListener('keydown', unlockAudio);
 
         document.addEventListener('pointerlockchange', () => {
             this.pointerLocked = document.pointerLockElement === this.canvas;
@@ -747,6 +1126,9 @@ export class GameEngine {
         // Update player movement
         this.updatePlayer(deltaTime);
 
+        // Footsteps + tree sway trigger
+        this.updateFootsteps(now);
+
         // Stream/generate chunks around player only when crossing chunk boundaries
         this.ensureChunksAroundPlayer();
 
@@ -758,6 +1140,9 @@ export class GameEngine {
 
         // Update transient effects
         this.updateEffects(now);
+
+        // Decaying tree sway animation
+        this.updateTreeSway(deltaTime);
 
         // Send player update to network (throttled to ~20 updates per second)
         const timeSinceLastNetworkUpdate = now - this.lastNetworkUpdate;
@@ -840,6 +1225,7 @@ export class GameEngine {
         const groundTile = this.worldGen.getTileAt(Math.floor(newX), Math.floor(newZ));
         const groundY = groundTile ? (groundTile.height * 10 + this.player.size) : this.player.size;
         const grounded = this.player.y <= groundY + 0.001;
+        this.player.grounded = grounded;
 
         // Jump (Space) - edge-triggered
         const spaceDown = !!this.keys[' '];
@@ -995,6 +1381,8 @@ export class GameEngine {
         this.lastShotAt = nowMs;
         this._shotsFired++;
 
+        this.playShootSound();
+
         const origin = this.camera?.position?.clone?.();
         if (!origin) return;
         const dir = new THREE.Vector3();
@@ -1120,6 +1508,8 @@ export class GameEngine {
         if (this.player.health <= 0) {
             this.player.alive = false;
             this.updateUI('status', 'You died');
+
+            this.playDeathSound();
 
             // Tell others we died (so they can animate our avatar)
             this.network.broadcast({
