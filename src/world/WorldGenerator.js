@@ -136,6 +136,46 @@ export class WorldGenerator {
                 const tile = chunk.tiles[y][x];
                 const rand = this.random(tile.x + 1000, tile.y + 1000);
 
+                // Collectible resources (spawn deterministically, sparse)
+                // These are intended to be gathered with E.
+                if (tile.walkable) {
+                    const r1 = this.random(tile.x + 9001, tile.y + 9002);
+                    const r2 = this.random(tile.x + 9011, tile.y + 9012);
+
+                    // Wood: mostly in forest/grass
+                    if ((tile.biome === 'FOREST' || tile.biome === 'GRASS') && r1 > 0.985) {
+                        chunk.entities.push({
+                            x: tile.x,
+                            y: tile.y,
+                            type: 'resource-wood',
+                            color: '#C28A3E',
+                            size: 0.35
+                        });
+                    }
+
+                    // Berries: mostly in grass
+                    if (tile.biome === 'GRASS' && r2 > 0.988) {
+                        chunk.entities.push({
+                            x: tile.x,
+                            y: tile.y,
+                            type: 'resource-berries',
+                            color: '#D81B60',
+                            size: 0.28
+                        });
+                    }
+
+                    // Stone: mostly in mountains (and some in sand)
+                    if ((tile.biome === 'MOUNTAIN' || tile.biome === 'SAND') && r1 > 0.986) {
+                        chunk.entities.push({
+                            x: tile.x,
+                            y: tile.y,
+                            type: 'resource-stone',
+                            color: '#90A4AE',
+                            size: 0.33
+                        });
+                    }
+                }
+
                 // Trees in forest and grass
                 if ((tile.biome === 'FOREST' && rand > 0.7) || 
                     (tile.biome === 'GRASS' && rand > 0.95)) {

@@ -85,6 +85,13 @@ class PigeonWorld {
                 playersEl.textContent = value;
             }
         });
+
+        this.game.setUICallback('resources', (value) => {
+            const el = document.getElementById('resources');
+            if (el) {
+                el.textContent = value;
+            }
+        });
     }
 
     /**

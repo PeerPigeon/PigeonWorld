@@ -60,6 +60,17 @@ export class GameEngine {
         this.lastShotAt = 0;
         this.rWasDown = false;
 
+        // Resource gathering
+        this.gatherRange = 3.5;
+        this.gatherCooldownMs = 250;
+        this.lastGatherAt = 0;
+        this.eWasDown = false;
+        this.inventory = { wood: 0, stone: 0, berries: 0 };
+        this.resourceMeshes = new Map(); // resourceKey -> mesh
+        this.collectedResources = new Set(); // resourceKey
+        this._gatherFlashUntil = 0;
+        this._gatherFlashColor = null;
+
         // Debug/telemetry
         this._shotsFired = 0;
 
@@ -136,7 +147,8 @@ export class GameEngine {
             chunk: null,
             peers: null,
             players: null,
-            status: null
+            status: null,
+            resources: null
         };
 
         // Game state
@@ -204,6 +216,8 @@ export class GameEngine {
         } else {
             this.updateUI('status', 'Offline Mode');
         }
+
+        this.updateResourcesUI();
 
         this.initialized = true;
         console.log('3D game engine initialized');
@@ -577,6 +591,157 @@ export class GameEngine {
         osc.stop(t0 + 0.36);
     }
 
+    updateResourcesUI() {
+        const inv = this.inventory || { wood: 0, stone: 0, berries: 0 };
+        this.updateUI('resources', `Wood ${inv.wood | 0} · Stone ${inv.stone | 0} · Berries ${inv.berries | 0}`);
+    }
+
+    playPickupSound() {
+        if (!this.sfxEnabled) return;
+        this.ensureAudio();
+        if (!this.audioCtx || !this.audioMaster) return;
+
+        const t0 = this.audioCtx.currentTime;
+        const osc = this.audioCtx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(720, t0);
+        osc.frequency.exponentialRampToValueAtTime(1200, t0 + 0.06);
+
+        const g = this.audioCtx.createGain();
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.18, t0 + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.10);
+
+        osc.connect(g);
+        g.connect(this.audioMaster);
+        osc.start(t0);
+        osc.stop(t0 + 0.11);
+    }
+
+    setAimDotStyle({ bg, border } = {}) {
+        if (typeof document === 'undefined') return;
+        const dot = document.getElementById('aim-dot');
+        if (!dot) return;
+        if (bg) dot.style.background = bg;
+        if (border) dot.style.border = border;
+    }
+
+    getNearestResource2D() {
+        if (!this.resourceMeshes || this.resourceMeshes.size === 0) return null;
+        const px = this.player?.x ?? 0;
+        const pz = this.player?.z ?? 0;
+
+        let best = null;
+        let bestD2 = Infinity;
+        for (const [key, mesh] of this.resourceMeshes.entries()) {
+            if (!mesh || !mesh.parent) continue;
+            const dx = mesh.position.x - px;
+            const dz = mesh.position.z - pz;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                best = { key, mesh, d: Math.sqrt(d2) };
+            }
+        }
+        return best;
+    }
+
+    updateGatherIndicator(nowMs) {
+        if (typeof document === 'undefined') return;
+        const dot = document.getElementById('aim-dot');
+        if (!dot) return;
+
+        const now = typeof nowMs === 'number' ? nowMs : Date.now();
+
+        if (this._gatherFlashUntil && now < this._gatherFlashUntil && this._gatherFlashColor) {
+            this.setAimDotStyle({
+                bg: this._gatherFlashColor,
+                border: '1px solid rgba(0,0,0,0.65)'
+            });
+            return;
+        }
+
+        // Default aim dot style
+        let bg = 'rgba(255,255,255,0.95)';
+        let border = '1px solid rgba(0,0,0,0.6)';
+
+        const nearest = this.getNearestResource2D();
+        if (nearest && nearest.d <= (this.gatherRange || 3.5)) {
+            // In range: indicate interactable
+            bg = 'rgba(255,230,120,0.95)';
+            border = '1px solid rgba(0,0,0,0.65)';
+        }
+
+        this.setAimDotStyle({ bg, border });
+    }
+
+    tryGather(nowMs) {
+        const now = typeof nowMs === 'number' ? nowMs : Date.now();
+        if (now - (this.lastGatherAt || 0) < (this.gatherCooldownMs || 250)) return;
+        this.lastGatherAt = now;
+        if (!this.player?.alive) return;
+
+        const px = this.player.x;
+        const py = this.player.y;
+        const pz = this.player.z;
+        const r = this.gatherRange || 2.3;
+        const maxDist2 = r * r;
+
+        let bestKey = null;
+        let bestMesh = null;
+        let bestD2 = Infinity;
+        let nearestAnyD2 = Infinity;
+
+        for (const [key, mesh] of this.resourceMeshes.entries()) {
+            if (!mesh || !mesh.parent) {
+                this.resourceMeshes.delete(key);
+                continue;
+            }
+            const dx = mesh.position.x - px;
+            const dz = mesh.position.z - pz;
+            // Gathering should feel forgiving: use horizontal distance.
+            // Vertical delta can be large (player eye height vs pickup height), especially on slopes.
+            const d2 = dx * dx + dz * dz;
+            if (d2 < nearestAnyD2) nearestAnyD2 = d2;
+            if (d2 <= maxDist2 && d2 < bestD2) {
+                bestD2 = d2;
+                bestKey = key;
+                bestMesh = mesh;
+            }
+        }
+
+        if (!bestKey || !bestMesh) {
+            const loaded = this.resourceMeshes?.size || 0;
+            const nearest = Number.isFinite(nearestAnyD2) ? Math.sqrt(nearestAnyD2) : null;
+            console.log('Gather pressed: nothing in range', { loaded, nearest });
+            this._gatherFlashColor = 'rgba(255,90,90,0.95)';
+            this._gatherFlashUntil = now + 180;
+            return;
+        }
+        const kind = bestMesh.userData?.resourceKind;
+        if (kind === 'wood') this.inventory.wood = (this.inventory.wood || 0) + 1;
+        else if (kind === 'stone') this.inventory.stone = (this.inventory.stone || 0) + 1;
+        else if (kind === 'berries') this.inventory.berries = (this.inventory.berries || 0) + 1;
+
+        this.collectedResources.add(bestKey);
+        this.resourceMeshes.delete(bestKey);
+
+        this.scene?.remove?.(bestMesh);
+        try {
+            bestMesh.geometry?.dispose?.();
+            if (Array.isArray(bestMesh.material)) bestMesh.material.forEach((m) => m?.dispose?.());
+            else bestMesh.material?.dispose?.();
+        } catch {
+            // ignore
+        }
+
+        this.playPickupSound();
+        this.updateResourcesUI();
+
+        this._gatherFlashColor = 'rgba(110,255,140,0.95)';
+        this._gatherFlashUntil = now + 140;
+    }
+
     updateFootsteps(nowMs) {
         if (!this.player?.alive) return;
         if (!this.player?.grounded) return;
@@ -707,6 +872,14 @@ export class GameEngine {
         // Unload chunks that are too far away
         for (const [chunkKey, group] of this.chunkGroups.entries()) {
             if (!nextVisible.has(chunkKey)) {
+                try {
+                    group?.traverse?.((obj) => {
+                        const rk = obj?.userData?.resourceKey;
+                        if (rk) this.resourceMeshes.delete(rk);
+                    });
+                } catch {
+                    // ignore
+                }
                 this.scene.remove(group);
                 this.chunkGroups.delete(chunkKey);
                 this.chunks.delete(chunkKey);
@@ -808,6 +981,47 @@ export class GameEngine {
             const height = tile.height * 10; // Match terrain height scale
 
             let geometry, material;
+
+            // Collectible resource nodes (always rendered; not subject to the decorative spawn filter)
+            if (typeof entity.type === 'string' && entity.type.startsWith('resource-')) {
+                const resourceKind = entity.type.replace('resource-', '');
+                const resourceKey = `${entity.type}@${entity.x},${entity.y}`;
+                if (this.collectedResources.has(resourceKey)) {
+                    continue;
+                }
+
+                const color = entity.color || '#ffffff';
+                const scale = (entity.size || 0.3) * 1.65;
+
+                if (resourceKind === 'wood') {
+                    geometry = new THREE.CylinderGeometry(scale * 0.55, scale * 0.55, scale * 0.9, 10);
+                } else if (resourceKind === 'stone') {
+                    geometry = new THREE.DodecahedronGeometry(scale * 0.65, 0);
+                } else {
+                    // berries
+                    geometry = new THREE.IcosahedronGeometry(scale * 0.55, 0);
+                }
+
+                material = new THREE.MeshStandardMaterial({
+                    color: new THREE.Color(color),
+                    emissive: new THREE.Color(color),
+                    emissiveIntensity: 1.0,
+                    metalness: 0.05,
+                    roughness: 0.45
+                });
+
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(worldX, height + 0.85, worldZ);
+                mesh.castShadow = true;
+                mesh.userData.resourceKind = resourceKind;
+                mesh.userData.resourceKey = resourceKey;
+                mesh.userData.baseY = mesh.position.y;
+                mesh.userData.phase = this.worldGen.random(entity.x + 7777, entity.y + 8888) * Math.PI * 2;
+                parentGroup.add(mesh);
+
+                this.resourceMeshes.set(resourceKey, mesh);
+                continue;
+            }
 
             // Simplified rendering - only add ~20% of entities for performance
             // IMPORTANT: keep this deterministic so chunks don't "change" when regenerated.
@@ -1041,18 +1255,32 @@ export class GameEngine {
      */
     setupInputHandlers() {
         window.addEventListener('keydown', (e) => {
-            const key = e.key.toLowerCase();
-            this.keys[key] = true;
+            const key = (e.key || '').toLowerCase();
+            if (key) this.keys[key] = true;
+
+            // Layout-agnostic bindings (e.g., international keyboards)
+            if (e.code === 'KeyE') {
+                this.keys['e'] = true;
+                // Trigger gather on keydown so it works even if keyup/state gets lost.
+                // Avoid OS key-repeat spamming.
+                if (!e.repeat) this.tryGather(Date.now());
+            }
+            if (e.code === 'KeyR') this.keys['r'] = true;
+            if (e.code === 'Space') this.keys[' '] = true;
             
             // Prevent default for game keys
-            if (['w', 'a', 's', 'd', 'r', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+            if (['w', 'a', 's', 'd', 'r', 'e', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
                 e.preventDefault();
             }
         });
 
         window.addEventListener('keyup', (e) => {
-            const key = e.key.toLowerCase();
-            this.keys[key] = false;
+            const key = (e.key || '').toLowerCase();
+            if (key) this.keys[key] = false;
+
+            if (e.code === 'KeyE') this.keys['e'] = false;
+            if (e.code === 'KeyR') this.keys['r'] = false;
+            if (e.code === 'Space') this.keys[' '] = false;
         });
         
         // Prevent context menu on right-click
@@ -1127,6 +1355,13 @@ export class GameEngine {
         }
         this.rWasDown = rDown;
 
+        // Gather input (edge-triggered)
+        const eDown = !!this.keys['e'];
+        if (eDown && !this.eWasDown) {
+            this.tryGather(now);
+        }
+        this.eWasDown = eDown;
+
         // Update player movement
         this.updatePlayer(deltaTime);
 
@@ -1145,6 +1380,12 @@ export class GameEngine {
         // Update transient effects
         this.updateEffects(now);
 
+        // Animate resource pickups (bob/rotate)
+        this.updateResourcePickups(deltaTime, now);
+
+        // Aim dot feedback for gathering
+        this.updateGatherIndicator(now);
+
         // Decaying tree sway animation
         this.updateTreeSway(deltaTime);
 
@@ -1161,6 +1402,26 @@ export class GameEngine {
         const chunkX = Math.floor(this.player.x / chunkSizeWorld);
         const chunkZ = Math.floor(this.player.z / chunkSizeWorld);
         this.updateUI('chunk', `${chunkX}, ${chunkZ}`);
+    }
+
+    updateResourcePickups(deltaTimeMs, nowMs) {
+        if (!this.resourceMeshes || this.resourceMeshes.size === 0) return;
+        const dt = Math.max(0, deltaTimeMs || 0) / 1000;
+        const t = (typeof nowMs === 'number' ? nowMs : Date.now()) / 1000;
+
+        for (const [key, mesh] of this.resourceMeshes.entries()) {
+            if (!mesh || !mesh.parent) {
+                this.resourceMeshes.delete(key);
+                continue;
+            }
+
+            const baseY = mesh.userData?.baseY;
+            if (typeof baseY === 'number') {
+                const phase = mesh.userData?.phase || 0;
+                mesh.position.y = baseY + Math.sin(t * 2.4 + phase) * 0.08;
+            }
+            mesh.rotation.y += dt * 1.4;
+        }
     }
 
     /**
