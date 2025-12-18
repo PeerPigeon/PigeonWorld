@@ -8,12 +8,12 @@ export class WorldGenerator {
         this.chunkSize = 32; // 32x32 tiles per chunk
         this.tileSize = 32; // pixels per tile
         this.biomes = {
-            WATER: { color: '#0D47A1', height: 0.3 }, // Deep navy blue - VERY distinct from sky
-            SAND: { color: '#FFB300', height: 0.4 }, // Bright golden sand
-            GRASS: { color: '#388E3C', height: 0.6 }, // Rich green grass
-            FOREST: { color: '#1B5E20', height: 0.75 }, // Dark forest green
-            MOUNTAIN: { color: '#424242', height: 0.9 }, // Dark gray mountains
-            SNOW: { color: '#FAFAFA', height: 1.0 } // Off-white snow
+            WATER: { color: '#003366', height: 0.3 }, // Dark navy blue - VERY distinct from sky
+            SAND: { color: '#FFD700', height: 0.4 }, // Golden sand
+            GRASS: { color: '#228B22', height: 0.6 }, // Forest green grass
+            FOREST: { color: '#0B3D0B', height: 0.75 }, // Very dark forest green
+            MOUNTAIN: { color: '#696969', height: 0.9 }, // Dim gray mountains
+            SNOW: { color: '#F0F0F0', height: 1.0 } // Light gray snow
         };
     }
 

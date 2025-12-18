@@ -21,7 +21,14 @@ export class GameEngine {
         
         // Camera settings for first-person view
         this.cameraOffset = new THREE.Vector3(0, 1.6, 0); // Eye level height
-        this.cameraLookAtDistance = 5; // Look ahead distance (reduced for better ground visibility)
+        this.cameraLookAtDistance = 12; // Look ahead distance
+
+        // First-person look controls
+        this.yaw = 0;
+        this.pitch = -0.45; // Default slightly downward so ground is visible
+        this.mouseSensitivity = 0.002;
+        this.turnSpeed = 2.2; // rad/sec for keyboard turning
+        this.pointerLocked = false;
 
         // Local player
         this.player = {
@@ -31,7 +38,7 @@ export class GameEngine {
             vx: 0,
             vy: 0,
             vz: 0,
-            speed: 0.2,
+            speed: 8, // units/sec
             rotation: 0,
             size: 2,
             color: '#FF5722'
@@ -44,10 +51,22 @@ export class GameEngine {
         this.chunks = new Map();
         this.visibleChunks = new Set();
 
+        // Chunk rendering/tracking (3D uses 1 unit per tile)
+        this.chunkRenderTileSize = 1;
+        this.viewDistance = 8;
+        this.chunkGroups = new Map();
+        this.lastStreamChunkX = null;
+        this.lastStreamChunkZ = null;
+
         // Input state
         this.keys = {};
+        this.spaceWasDown = false;
         this.lastUpdate = Date.now();
         this.lastNetworkUpdate = Date.now();
+
+        // Simple physics
+        this.gravity = 30; // units/sec^2
+        this.jumpSpeed = 8; // units/sec
 
         // UI update callbacks
         this.uiCallbacks = {
@@ -78,6 +97,18 @@ export class GameEngine {
         // Generate initial world
         this.generateWorld();
 
+        // Start on the ground so you can see terrain immediately
+        this.snapPlayerToGround();
+
+        // Place camera at player right away (avoid long smoothing from the default camera position)
+        if (this.camera) {
+            this.camera.position.set(
+                this.player.x + this.cameraOffset.x,
+                this.player.y + this.cameraOffset.y,
+                this.player.z + this.cameraOffset.z
+            );
+        }
+
         // Initialize network
         const networkSuccess = await this.network.init();
         
@@ -96,13 +127,25 @@ export class GameEngine {
     }
 
     /**
+     * Snap player height to terrain at current X/Z.
+     */
+    snapPlayerToGround() {
+        const tile = this.worldGen.getTileAt(Math.floor(this.player.x), Math.floor(this.player.z));
+        if (tile) {
+            this.player.y = tile.height * 10 + this.player.size;
+        }
+    }
+
+    /**
      * Initialize Three.js scene, camera, and renderer
      */
     initThreeJS() {
         // Create scene
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x87CEEB); // Sky blue
-        this.scene.fog = new THREE.Fog(0x87CEEB, 50, 200);
+        // Fade distant terrain into the sky so chunk edges dissolve.
+        // Exponential fog is key for hiding the "square" boundary.
+        this.scene.fog = new THREE.FogExp2(0x87CEEB, 0.006);
 
         // Create camera
         this.camera = new THREE.PerspectiveCamera(
@@ -120,6 +163,8 @@ export class GameEngine {
             antialias: true 
         });
         this.renderer.setSize(window.innerWidth, window.innerHeight);
+        // Ensure hex/CSS colors render as expected (avoid washed-out look)
+        this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.shadowMap.enabled = true;
         this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
@@ -165,21 +210,53 @@ export class GameEngine {
      * Generate the 3D world
      */
     generateWorld() {
-        const viewDistance = 2; // Reduced for performance
-        const chunkSize = this.worldGen.chunkSize;
+        console.log('Generating initial procedural chunks...');
+        this.ensureChunksAroundPlayer(true);
+    }
 
+    /**
+     * Ensure chunks exist around the player's current chunk.
+     * This is the core of procedural generation (streaming chunks as you move).
+     */
+    ensureChunksAroundPlayer(force = false) {
+        const chunkSizeWorld = this.worldGen.chunkSize * this.chunkRenderTileSize;
+        const centerChunkX = Math.floor(this.player.x / chunkSizeWorld);
+        const centerChunkZ = Math.floor(this.player.z / chunkSizeWorld);
 
+        if (!force && this.lastStreamChunkX === centerChunkX && this.lastStreamChunkZ === centerChunkZ) {
+            return;
+        }
 
-        for (let chunkZ = -viewDistance; chunkZ <= viewDistance; chunkZ++) {
-            for (let chunkX = -viewDistance; chunkX <= viewDistance; chunkX++) {
+        this.lastStreamChunkX = centerChunkX;
+        this.lastStreamChunkZ = centerChunkZ;
+
+        const nextVisible = new Set();
+
+        for (let dz = -this.viewDistance; dz <= this.viewDistance; dz++) {
+            for (let dx = -this.viewDistance; dx <= this.viewDistance; dx++) {
+                const chunkX = centerChunkX + dx;
+                const chunkZ = centerChunkZ + dz;
                 const chunkKey = `${chunkX},${chunkZ}`;
-                const chunk = this.worldGen.generateChunk(chunkX, chunkZ);
-                this.chunks.set(chunkKey, chunk);
-                this.addChunkToScene(chunk);
+                nextVisible.add(chunkKey);
+
+                if (!this.chunks.has(chunkKey)) {
+                    const chunk = this.worldGen.generateChunk(chunkX, chunkZ);
+                    this.chunks.set(chunkKey, chunk);
+                    this.addChunkToScene(chunk);
+                }
             }
         }
-        
 
+        // Unload chunks that are too far away
+        for (const [chunkKey, group] of this.chunkGroups.entries()) {
+            if (!nextVisible.has(chunkKey)) {
+                this.scene.remove(group);
+                this.chunkGroups.delete(chunkKey);
+                this.chunks.delete(chunkKey);
+            }
+        }
+
+        this.visibleChunks = nextVisible;
     }
 
     /**
@@ -187,46 +264,44 @@ export class GameEngine {
      */
     addChunkToScene(chunk) {
         const chunkSize = this.worldGen.chunkSize;
-        const tileSize = 1; // Use 1 unit per tile for better scale in 3D
+        const tileSize = this.chunkRenderTileSize;
 
-        // Create geometry for the terrain
+        const group = new THREE.Group();
+        group.userData.chunkKey = `${chunk.x},${chunk.z}`;
+
+        // Create geometry for the terrain as a shared-vertex heightfield.
+        // This avoids the "everything is a square" look from per-tile flat quads.
         const geometry = new THREE.BufferGeometry();
         const vertices = [];
         const colors = [];
         const indices = [];
 
+        const vertSize = chunkSize + 1;
+
+        for (let z = 0; z < vertSize; z++) {
+            for (let x = 0; x < vertSize; x++) {
+                const worldTileX = chunk.x * chunkSize + x;
+                const worldTileZ = chunk.z * chunkSize + z;
+
+                const height01 = this.worldGen.fractalNoise(worldTileX, worldTileZ);
+                const biome = this.worldGen.getBiome(height01);
+                const color = new THREE.Color(biome.color);
+
+                vertices.push(worldTileX * tileSize, height01 * 10, worldTileZ * tileSize);
+                colors.push(color.r, color.g, color.b);
+            }
+        }
+
         for (let z = 0; z < chunkSize; z++) {
             for (let x = 0; x < chunkSize; x++) {
-                const tile = chunk.tiles[z][x];
-                const worldX = (chunk.x * chunkSize + x) * tileSize;
-                const worldZ = (chunk.z * chunkSize + z) * tileSize;
-                const height = tile.height * 10; // Scale height to 0-10 range
+                const v00 = z * vertSize + x;
+                const v10 = v00 + 1;
+                const v01 = v00 + vertSize;
+                const v11 = v01 + 1;
 
-                // Get color from biome
-                const color = new THREE.Color(tile.color);
-
-                // Create quad vertices (two triangles per tile)
-                const x0 = worldX;
-                const x1 = worldX + tileSize;
-                const z0 = worldZ;
-                const z1 = worldZ + tileSize;
-
-                const idx = vertices.length / 3;
-
-                // Four corners
-                vertices.push(x0, height, z0);
-                vertices.push(x1, height, z0);
-                vertices.push(x1, height, z1);
-                vertices.push(x0, height, z1);
-
-                // Colors for each vertex
-                for (let i = 0; i < 4; i++) {
-                    colors.push(color.r, color.g, color.b);
-                }
-
-                // Two triangles
-                indices.push(idx, idx + 1, idx + 2);
-                indices.push(idx, idx + 2, idx + 3);
+                // Two triangles per quad
+                indices.push(v00, v10, v11);
+                indices.push(v00, v11, v01);
             }
         }
 
@@ -239,23 +314,30 @@ export class GameEngine {
             vertexColors: true,
             flatShading: true,
             metalness: 0.2,
-            roughness: 0.8
+            roughness: 0.8,
+            // Let neutral haze fade distant terrain (prevents a hard square boundary)
+            fog: true,
+            side: THREE.DoubleSide
         });
 
         const mesh = new THREE.Mesh(geometry, material);
         mesh.receiveShadow = true;
         mesh.userData.chunkKey = `${chunk.x},${chunk.z}`;
-        this.scene.add(mesh);
+        group.add(mesh);
 
-        // Add entities (trees, rocks, etc.)
-        this.addEntitiesToScene(chunk);
+        // Add entities (trees, rocks, etc.) into the same chunk group
+        this.addEntitiesToScene(chunk, group);
+
+        const key = `${chunk.x},${chunk.z}`;
+        this.chunkGroups.set(key, group);
+        this.scene.add(group);
     }
 
     /**
      * Add entities like trees and rocks to the scene
      */
-    addEntitiesToScene(chunk) {
-        const tileSize = 1; // Match terrain scale
+    addEntitiesToScene(chunk, parentGroup) {
+        const tileSize = this.chunkRenderTileSize;
         const chunkSize = this.worldGen.chunkSize;
 
         for (const entity of chunk.entities) {
@@ -270,8 +352,10 @@ export class GameEngine {
 
             let geometry, material;
 
-            // Simplified rendering - only add 20% of entities for performance
-            if (Math.random() > 0.8) {
+            // Simplified rendering - only add ~20% of entities for performance
+            // IMPORTANT: keep this deterministic so chunks don't "change" when regenerated.
+            const spawnRand = this.worldGen.random(entity.x + 4242, entity.y + 4242);
+            if (spawnRand > 0.8) {
                 if (entity.type === 'tree') {
                     // Simpler tree representation
                     const treeGeom = new THREE.ConeGeometry(2, 5, 6);
@@ -279,7 +363,7 @@ export class GameEngine {
                     const tree = new THREE.Mesh(treeGeom, treeMat);
                     tree.position.set(worldX, height + 2.5, worldZ);
                     tree.castShadow = true;
-                    this.scene.add(tree);
+                    parentGroup.add(tree);
 
                 } else if (entity.type === 'rock') {
                     geometry = new THREE.BoxGeometry(entity.size * 2, entity.size * 2, entity.size * 2);
@@ -291,7 +375,7 @@ export class GameEngine {
                     const mesh = new THREE.Mesh(geometry, material);
                     mesh.position.set(worldX, height + entity.size, worldZ);
                     mesh.castShadow = true;
-                    this.scene.add(mesh);
+                    parentGroup.add(mesh);
                 }
             }
         }
@@ -329,16 +413,42 @@ export class GameEngine {
      */
     setupInputHandlers() {
         window.addEventListener('keydown', (e) => {
-            this.keys[e.key.toLowerCase()] = true;
+            const key = e.key.toLowerCase();
+            this.keys[key] = true;
             
             // Prevent default for game keys
-            if (['w', 'a', 's', 'd', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(e.key.toLowerCase())) {
+            if (['w', 'a', 's', 'd', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
                 e.preventDefault();
             }
         });
 
         window.addEventListener('keyup', (e) => {
-            this.keys[e.key.toLowerCase()] = false;
+            const key = e.key.toLowerCase();
+            this.keys[key] = false;
+        });
+        
+        // Prevent context menu on right-click
+        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Click-to-focus + pointer lock for natural mouse-look
+        this.canvas.addEventListener('click', () => {
+            this.canvas.focus?.();
+            if (document.pointerLockElement !== this.canvas) {
+                this.canvas.requestPointerLock?.();
+            }
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            this.pointerLocked = document.pointerLockElement === this.canvas;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!this.pointerLocked) return;
+            // Invert yaw so moving mouse right turns right
+            this.yaw -= e.movementX * this.mouseSensitivity;
+            this.pitch -= e.movementY * this.mouseSensitivity;
+            // Clamp pitch to avoid flipping over
+            this.pitch = Math.max(-1.2, Math.min(1.2, this.pitch));
         });
     }
 
@@ -378,6 +488,9 @@ export class GameEngine {
         // Update player movement
         this.updatePlayer(deltaTime);
 
+        // Stream/generate chunks around player only when crossing chunk boundaries
+        this.ensureChunksAroundPlayer();
+
         // Update camera
         this.updateCamera();
 
@@ -393,8 +506,9 @@ export class GameEngine {
 
         // Update UI
         this.updateUI('position', `${Math.floor(this.player.x)}, ${Math.floor(this.player.z)}`);
-        const chunkX = Math.floor(this.player.x / (this.worldGen.chunkSize * this.worldGen.tileSize));
-        const chunkZ = Math.floor(this.player.z / (this.worldGen.chunkSize * this.worldGen.tileSize));
+        const chunkSizeWorld = this.worldGen.chunkSize * this.chunkRenderTileSize;
+        const chunkX = Math.floor(this.player.x / chunkSizeWorld);
+        const chunkZ = Math.floor(this.player.z / chunkSizeWorld);
         this.updateUI('chunk', `${chunkX}, ${chunkZ}`);
     }
 
@@ -402,51 +516,93 @@ export class GameEngine {
      * Update player position based on input - 3D version
      */
     updatePlayer(deltaTime) {
-        const speed = this.player.speed * deltaTime;
+        const dt = deltaTime / 1000;
+        const speed = this.player.speed * dt;
+
+        // Optional keyboard turning (useful before pointer lock or without mouse)
+        if (this.keys['arrowleft']) this.yaw += this.turnSpeed * dt;
+        if (this.keys['arrowright']) this.yaw -= this.turnSpeed * dt;
 
         // Reset velocity
         this.player.vx = 0;
         this.player.vz = 0;
 
-        // WASD movement in 3D space
-        if (this.keys['w'] || this.keys['arrowup']) this.player.vz -= speed;
-        if (this.keys['s'] || this.keys['arrowdown']) this.player.vz += speed;
-        if (this.keys['a'] || this.keys['arrowleft']) this.player.vx -= speed;
-        if (this.keys['d'] || this.keys['arrowright']) this.player.vx += speed;
+        // WASD movement relative to where you're looking (FPS-style)
+        // Use Three.js convention: yaw=0 faces -Z
+        const forwardX = -Math.sin(this.yaw);
+        const forwardZ = -Math.cos(this.yaw);
+        const rightX = Math.cos(this.yaw);
+        const rightZ = -Math.sin(this.yaw);
+
+        let moveX = 0;
+        let moveZ = 0;
+        if (this.keys['w'] || this.keys['arrowup']) {
+            moveX += forwardX;
+            moveZ += forwardZ;
+        }
+        if (this.keys['s'] || this.keys['arrowdown']) {
+            moveX -= forwardX;
+            moveZ -= forwardZ;
+        }
+        if (this.keys['a']) {
+            moveX -= rightX;
+            moveZ -= rightZ;
+        }
+        if (this.keys['d']) {
+            moveX += rightX;
+            moveZ += rightZ;
+        }
 
         // Normalize diagonal movement
-        if (this.player.vx !== 0 && this.player.vz !== 0) {
-            const magnitude = Math.sqrt(this.player.vx * this.player.vx + this.player.vz * this.player.vz);
-            this.player.vx = (this.player.vx / magnitude) * speed;
-            this.player.vz = (this.player.vz / magnitude) * speed;
+        const moveMag = Math.hypot(moveX, moveZ);
+        if (moveMag > 0) {
+            moveX = (moveX / moveMag) * speed;
+            moveZ = (moveZ / moveMag) * speed;
         }
+
+        this.player.vx = moveX;
+        this.player.vz = moveZ;
 
         // Update position
         const newX = this.player.x + this.player.vx;
         const newZ = this.player.z + this.player.vz;
 
+        // Ground height at proposed X/Z
+        const groundTile = this.worldGen.getTileAt(Math.floor(newX), Math.floor(newZ));
+        const groundY = groundTile ? (groundTile.height * 10 + this.player.size) : this.player.size;
+        const grounded = this.player.y <= groundY + 0.001;
+
+        // Jump (Space) - edge-triggered
+        const spaceDown = !!this.keys[' '];
+        if (spaceDown && !this.spaceWasDown && grounded) {
+            this.player.vy = this.jumpSpeed;
+        }
+        this.spaceWasDown = spaceDown;
+
+        // Apply gravity
+        this.player.vy -= this.gravity * dt;
+
+        // Integrate vertical motion
+        let newY = this.player.y + this.player.vy;
+        if (newY < groundY) {
+            newY = groundY;
+            this.player.vy = 0;
+        }
+
         // Check if new position is walkable and update height
-        const tile = this.worldGen.getTileAt(
-            Math.floor(newX), 
-            Math.floor(newZ)
-        );
-        
-        if (tile && tile.walkable) {
+        if (groundTile && groundTile.walkable) {
             this.player.x = newX;
             this.player.z = newZ;
-            // Set player height based on terrain (match terrain scale)
-            this.player.y = tile.height * 10 + this.player.size;
+            this.player.y = newY;
         }
 
         // Update player mesh position
         if (this.playerMesh) {
             this.playerMesh.position.set(this.player.x, this.player.y, this.player.z);
             
-            // Rotate player mesh based on movement direction
-            if (this.player.vx !== 0 || this.player.vz !== 0) {
-                this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
-                this.playerMesh.rotation.y = this.player.rotation;
-            }
+            // Rotate player mesh to match camera yaw
+            this.player.rotation = this.yaw;
+            this.playerMesh.rotation.y = this.player.rotation;
         }
     }
 
@@ -466,18 +622,17 @@ export class GameEngine {
         this.camera.position.y += (targetY - this.camera.position.y) * smoothing;
         this.camera.position.z += (targetZ - this.camera.position.z) * smoothing;
         
-        // Calculate look direction based on player rotation
-        // If player is moving, use movement direction; otherwise maintain current direction
-        if (this.player.vx !== 0 || this.player.vz !== 0) {
-            this.player.rotation = Math.atan2(this.player.vx, this.player.vz);
-        }
-        
-        // Look ahead at horizon level - camera looks straight ahead, not down
-        // This creates a sea/horizon view where sky meets ground naturally
+        // Look direction from yaw/pitch
+        const cosPitch = Math.cos(this.pitch);
+        // Use Three.js convention: yaw=0 faces -Z
+        const dirX = -Math.sin(this.yaw) * cosPitch;
+        const dirY = Math.sin(this.pitch);
+        const dirZ = -Math.cos(this.yaw) * cosPitch;
+
         const lookAtPoint = new THREE.Vector3(
-            this.player.x + Math.sin(this.player.rotation) * this.cameraLookAtDistance,
-            this.player.y + this.cameraOffset.y, // Same height as camera = horizon level view
-            this.player.z + Math.cos(this.player.rotation) * this.cameraLookAtDistance
+            this.camera.position.x + dirX * this.cameraLookAtDistance,
+            this.camera.position.y + dirY * this.cameraLookAtDistance,
+            this.camera.position.z + dirZ * this.cameraLookAtDistance
         );
         this.camera.lookAt(lookAtPoint);
     }

@@ -18,6 +18,10 @@ export class NetworkManager {
         this.eventHandlers = new Map();
         this.connected = false;
         this.worldId = 'pigeonworld-main'; // Shared world instance
+        this.hubUrl = 'wss://pigeonhub.fly.dev';
+        this._handlersBound = false;
+        this._peerMaintenanceTimer = null;
+        this._lastStatusSignature = null;
     }
 
     /**
@@ -30,7 +34,16 @@ export class NetworkManager {
             // Initialize PeerPigeon mesh
             this.mesh = new PeerPigeonMesh({
                 enableWebDHT: true,
-                peerId: this.generatePeerId()
+                // PeerPigeon expects a hex peerId for XOR routing / distance
+                peerId: this.generatePeerId(),
+                // Use global discovery for reliability.
+                // Filter messages by worldId at the app layer.
+                networkName: 'global',
+                // Let the hub + WebDHT find peers and automatically connect
+                autoDiscovery: true,
+                autoConnect: true,
+                minPeers: 2,
+                maxPeers: 32
             });
 
             await this.mesh.init();
@@ -38,13 +51,35 @@ export class NetworkManager {
             
             console.log(`Initialized with Peer ID: ${this.peerId}`);
 
+            // Set up message handlers BEFORE connecting so we don't miss early discovery events
+            this.setupMessageHandlers();
+
             // Connect to signaling server
-            await this.mesh.connect('wss://pigeonhub.fly.dev');
+            await this.mesh.connect(this.hubUrl);
+            this.connected = true;
             
             console.log('Connected to signaling server');
 
+            try {
+                console.log('[PeerPigeon status snapshot]', this.mesh.getStatus?.());
+            } catch {
+                // ignore
+            }
+
+            // Kick the mesh optimizer: connect to any already-discovered peers
+            try {
+                this.mesh.forceConnectToAllPeers?.();
+            } catch {
+                // ignore
+            }
+
+            // Keep the in-game peer list in sync and keep nudging connections.
+            // This avoids the "Connected but 0 peers" situation when discovery is slow.
+            this.startPeerMaintenance();
+
             // Initialize PigeonMatch matchmaking engine
             this.matchmaker = new MatchmakingEngine({
+                minPeers: 2,
                 maxPeers: 100,
                 namespace: this.worldId,
                 matchTimeout: 30000,
@@ -65,10 +100,6 @@ export class NetworkManager {
             // Join or create world instance
             await this.joinWorld();
 
-            // Set up message handlers
-            this.setupMessageHandlers();
-
-            this.connected = true;
             console.log('Network initialization complete');
 
             return true;
@@ -80,11 +111,92 @@ export class NetworkManager {
         }
     }
 
+    startPeerMaintenance() {
+        if (!this.mesh) return;
+        if (this._peerMaintenanceTimer) return;
+
+        const tick = () => {
+            if (!this.mesh || !this.connected) return;
+
+            // Snapshot diagnostics (log only when counts change)
+            try {
+                const s = this.mesh.getStatus?.();
+                if (s) {
+                    const signature = `${s.networkName}|disc:${s.discoveredCount}|conn:${s.connectedCount}|total:${s.totalPeerCount}`;
+                    if (signature !== this._lastStatusSignature) {
+                        this._lastStatusSignature = signature;
+                        console.log('[PeerPigeon status]', s);
+                    }
+                }
+            } catch {
+                // ignore
+            }
+
+            // Actively connect to newly discovered peers
+            try {
+                const discovered = this.mesh.getDiscoveredPeers?.() || [];
+                for (const p of discovered) {
+                    if (!p?.peerId) continue;
+                    if (p.peerId === this.peerId) continue;
+                    if (p.isConnected) continue;
+                    try {
+                        this.mesh.connectToPeer(p.peerId);
+                    } catch {
+                        // ignore
+                    }
+                }
+            } catch {
+                // ignore
+            }
+
+            // Force connect to any discovered peers
+            try {
+                this.mesh.forceConnectToAllPeers?.();
+            } catch {
+                // ignore
+            }
+
+            // Sync connected peers into our map
+            this.syncPeersFromMesh();
+        };
+
+        // Run immediately and then periodically
+        tick();
+        this._peerMaintenanceTimer = setInterval(tick, 2000);
+    }
+
+    syncPeersFromMesh() {
+        if (!this.mesh) return;
+
+        try {
+            const peerList = this.mesh.getPeers?.() || [];
+            // peerList items look like { peerId, status, ... }
+            const next = new Map();
+            for (const p of peerList) {
+                if (!p || !p.peerId) continue;
+                if (p.status === 'connected' || p.status === 'channel-connecting') {
+                    next.set(p.peerId, { id: p.peerId, connectedAt: Date.now(), status: p.status });
+                }
+            }
+
+            const changed = next.size !== this.peers.size;
+            this.peers = next;
+            if (changed) {
+                this.emit('peer-connected');
+            }
+        } catch {
+            // ignore
+        }
+    }
+
     /**
      * Generate a unique peer ID
      */
     generatePeerId() {
-        return 'player-' + Math.random().toString(36).substring(2, 11);
+        // 32 bytes => 64 hex chars
+        const bytes = new Uint8Array(32);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
     }
 
     /**
@@ -97,6 +209,7 @@ export class NetworkManager {
             // Announce presence to other peers in the mesh
             this.broadcast({
                 type: 'player-join',
+                worldId: this.worldId,
                 peerId: this.peerId,
                 timestamp: Date.now()
             });
@@ -113,24 +226,159 @@ export class NetworkManager {
     setupMessageHandlers() {
         if (!this.mesh) return;
 
-        // Listen for messages from other peers
-        this.mesh.on('message', (data) => {
-            this.handleMessage(data);
+        // Avoid double-binding if init() is called twice
+        if (this._handlersBound) return;
+        this._handlersBound = true;
+
+        this.mesh.on('statusChanged', (status) => {
+            // Helpful for diagnosing "0 peers" without changing UI
+            console.log('[PeerPigeon status]', status);
         });
 
-        // Listen for peer connections
-        this.mesh.on('peer-connected', (peerId) => {
-            console.log('Peer connected:', peerId);
-            this.peers.set(peerId, { id: peerId, connectedAt: Date.now() });
-            this.emit('peer-connected', peerId);
+        // Compatibility shim: some signaling servers/bundle versions may send
+        // peer announcements without `fromPeerId`. If so, PeerPigeon won't
+        // discover peers. We tap raw signaling messages and feed peer IDs
+        // into peerDiscovery ourselves.
+        try {
+            const client = this.mesh.signalingClient;
+            const handler = (msg) => {
+                if (!msg || typeof msg !== 'object') return;
+
+                const type = msg.type;
+                const candidatePeerId =
+                    msg.fromPeerId ||
+                    msg.peerId ||
+                    msg.data?.peerId ||
+                    msg.data?.fromPeerId ||
+                    msg.data?.id;
+
+                if (!candidatePeerId || typeof candidatePeerId !== 'string') return;
+                if (candidatePeerId === this.peerId) return;
+
+                // Only treat certain message types as discovery hints.
+                if (type === 'announce' || type === 'peer-discovered' || type === 'peerDiscovered' || type === 'peer') {
+                    this.mesh.peerDiscovery?.addDiscoveredPeer?.(candidatePeerId);
+                }
+            };
+
+            if (client && typeof client.addEventListener === 'function') {
+                client.addEventListener('signalingMessage', handler);
+            } else if (client && typeof client.on === 'function') {
+                client.on('signalingMessage', handler);
+            }
+        } catch {
+            // ignore
+        }
+
+        const ingestPayload = (fromPeerId, raw) => {
+            let payload = raw;
+
+            // If the gossip layer gives us a JSON string, parse it.
+            if (typeof payload === 'string') {
+                try {
+                    payload = JSON.parse(payload);
+                } catch {
+                    return;
+                }
+            }
+
+            // If the datachannel gave us an unparseable string, PeerPigeon wraps it as { content: string }
+            if (payload && typeof payload === 'object' && typeof payload.content === 'string') {
+                try {
+                    payload = JSON.parse(payload.content);
+                } catch {
+                    return;
+                }
+            }
+
+            if (!payload || typeof payload !== 'object') return;
+            if (!payload.peerId && fromPeerId) payload.peerId = fromPeerId;
+
+            // PeerPigeon echoes local chat broadcasts back to the sender.
+            // Ignore our own messages so we don't treat ourselves as a remote player.
+            if (fromPeerId && fromPeerId === this.peerId) return;
+            if (payload.peerId && payload.peerId === this.peerId) return;
+
+            this.handleMessage(payload);
+        };
+
+        // PeerPigeon gossip delivers app messages via `messageReceived`.
+        this.mesh.on('messageReceived', (data) => {
+            const fromPeerId = data?.from || data?.peerId;
+            const raw = data?.content ?? data?.message ?? data;
+            ingestPayload(fromPeerId, raw);
+        });
+
+        // Also listen to low-level datachannel messages just in case.
+        this.mesh.on('message', ({ peerId, message }) => {
+            ingestPayload(peerId, message);
+        });
+
+        // Peer discovery: request a connection when a peer is discovered.
+        // (PeerPigeon may do this automatically when autoDiscovery=true, but this helps.)
+        this.mesh.on('peerDiscovered', (data) => {
+            const discoveredPeerId = typeof data === 'string' ? data : data?.peerId;
+            if (!discoveredPeerId) return;
+            console.log('Peer discovered:', discoveredPeerId);
+            try {
+                this.mesh.connectToPeer(discoveredPeerId);
+            } catch {
+                // ignore
+            }
+        });
+
+        // Helpful debug signal when the mesh updates its peer table
+        this.mesh.on('peersUpdated', () => {
+            try {
+                this.mesh.forceConnectToAllPeers?.();
+            } catch {
+                // ignore
+            }
+            this.syncPeersFromMesh();
+        });
+
+        // Listen for peer connections (PeerPigeon uses camelCase)
+        this.mesh.on('peerConnected', (data) => {
+            const connectedPeerId = typeof data === 'string' ? data : data?.peerId;
+            if (!connectedPeerId) return;
+            console.log('Peer connected:', connectedPeerId);
+            this.peers.set(connectedPeerId, { id: connectedPeerId, connectedAt: Date.now() });
+            this.emit('peer-connected', connectedPeerId);
+
+            // Ensure late connections still see us.
+            this.sendDirect(connectedPeerId, {
+                type: 'player-join',
+                worldId: this.worldId,
+                peerId: this.peerId,
+                timestamp: Date.now()
+            });
+
+            if (this.localPlayer) {
+                this.sendDirect(connectedPeerId, {
+                    type: 'player-update',
+                    worldId: this.worldId,
+                    peerId: this.peerId,
+                    state: {
+                        x: this.localPlayer.x,
+                        y: this.localPlayer.y,
+                        z: this.localPlayer.z,
+                        vx: this.localPlayer.vx || 0,
+                        vy: this.localPlayer.vy || 0,
+                        vz: this.localPlayer.vz || 0
+                    },
+                    timestamp: Date.now()
+                });
+            }
         });
 
         // Listen for peer disconnections
-        this.mesh.on('peer-disconnected', (peerId) => {
-            console.log('Peer disconnected:', peerId);
-            this.peers.delete(peerId);
-            this.players.delete(peerId);
-            this.emit('peer-disconnected', peerId);
+        this.mesh.on('peerDisconnected', (data) => {
+            const disconnectedPeerId = typeof data === 'string' ? data : data?.peerId;
+            if (!disconnectedPeerId) return;
+            console.log('Peer disconnected:', disconnectedPeerId);
+            this.peers.delete(disconnectedPeerId);
+            this.players.delete(disconnectedPeerId);
+            this.emit('peer-disconnected', disconnectedPeerId);
         });
     }
 
@@ -139,6 +387,10 @@ export class NetworkManager {
      */
     handleMessage(data) {
         if (!data || !data.type) return;
+
+        // When using global discovery, filter by worldId when present,
+        // but stay backward compatible with older clients that don't send worldId.
+        if (data.worldId && data.worldId !== this.worldId) return;
 
         switch (data.type) {
             case 'player-join':
@@ -214,15 +466,34 @@ export class NetworkManager {
 
         this.broadcast({
             type: 'player-update',
+            worldId: this.worldId,
             peerId: this.peerId,
             state: {
                 x: player.x,
                 y: player.y,
+                z: player.z,
                 vx: player.vx || 0,
-                vy: player.vy || 0
+                vy: player.vy || 0,
+                vz: player.vz || 0
             },
             timestamp: Date.now()
         });
+    }
+
+    async sendDirect(peerId, message) {
+        if (!this.mesh || !this.connected) return;
+        if (!peerId) return;
+
+        try {
+            // Use DM (default subtype) because it's delivered to apps via `messageReceived`.
+            if (typeof this.mesh.sendDirectMessage === 'function') {
+                await this.mesh.sendDirectMessage(peerId, message);
+            } else {
+                await this.mesh.sendMessage(JSON.stringify(message));
+            }
+        } catch {
+            // ignore
+        }
     }
 
     /**
@@ -232,6 +503,8 @@ export class NetworkManager {
         if (!this.mesh || !this.connected) return;
 
         try {
+            // PeerPigeon only delivers gossip `messageReceived` to apps for subtype `chat` (string) or `dm`.
+            // So for broadcast game state, encode as JSON string and send as chat.
             await this.mesh.sendMessage(JSON.stringify(message));
         } catch (error) {
             console.error('Failed to broadcast message:', error);
@@ -285,6 +558,7 @@ export class NetworkManager {
         // Announce leave
         this.broadcast({
             type: 'player-leave',
+            worldId: this.worldId,
             peerId: this.peerId,
             timestamp: Date.now()
         });
