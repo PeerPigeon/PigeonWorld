@@ -202,6 +202,12 @@ export class NetworkManager {
         const now = Date.now();
         for (const [peerId, player] of this.players.entries()) {
             if (!peerId || peerId === this.peerId) continue;
+
+            // If the peer is currently connected at the transport layer, don't prune them.
+            // It's better to keep a placeholder than to pop in/out due to missed updates.
+            if (this.peers && this.peers.has(peerId)) {
+                continue;
+            }
             const lastSeen = player?.lastSeen || player?.joinedAt || 0;
 
             // Distance-based stale timeout (near players tolerated longer)
@@ -230,8 +236,9 @@ export class NetworkManager {
      * Generate a unique peer ID
      */
     generatePeerId() {
-        // 32 bytes => 64 hex chars
-        const bytes = new Uint8Array(32);
+        // PeerPigeon browser bundle expects 20 bytes => 40 hex chars.
+        // (Its gossip direct-message path validates /^[a-fA-F0-9]{40}$/.)
+        const bytes = new Uint8Array(20);
         crypto.getRandomValues(bytes);
         return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
     }
@@ -407,6 +414,7 @@ export class NetworkManager {
                         x: this.localPlayer.x,
                         y: this.localPlayer.y,
                         z: this.localPlayer.z,
+                        r: typeof this.localPlayer.rotation === 'number' ? this.localPlayer.rotation : 0,
                         vx: this.localPlayer.vx || 0,
                         vy: this.localPlayer.vy || 0,
                         vz: this.localPlayer.vz || 0
@@ -527,6 +535,7 @@ export class NetworkManager {
                 x: player.x,
                 y: player.y,
                 z: player.z,
+                r: typeof player.rotation === 'number' ? player.rotation : 0,
                 vx: player.vx || 0,
                 vy: player.vy || 0,
                 vz: player.vz || 0

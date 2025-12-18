@@ -35,6 +35,15 @@ PigeonWorld is a browser-based, peer-to-peer multiplayer **3D** open world game 
 - Player state synchronization in 3D space
 - Support for up to 100 players per world instance
 
+## Peer Avatar Model
+
+Remote peers use the **RobotExpressive** model (CC0 1.0).
+
+- Source: https://github.com/mrdoob/three.js/tree/master/examples/models/gltf/RobotExpressive
+- Credits (per upstream README): Model by Tomás Laulhé (Quaternius), modifications by Don McCurdy
+
+You can override the peer model by adding a binary glTF file at `public/models/peer.glb`.
+
 ### Gameplay
 - Explore an infinite procedural 3D world
 - See other players in real-time as 3D avatars
