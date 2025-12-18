@@ -86,6 +86,10 @@ export class GameEngine {
         // Simple transient visual effects (tracers, flashes)
         this.effects = [];
 
+        // Cached VFX textures (soft edges)
+        this._beamAlphaTex = null;
+        this._flashTex = null;
+
         // Remote players
         this.remotePlayers = new Map();
 
@@ -1444,14 +1448,20 @@ export class GameEngine {
         if (!isFinite(len) || len <= 0.001) return;
         dir.normalize();
 
+        const alphaTex = this.getBeamAlphaTexture();
+
         // A thin cylinder is much more visible than a line in WebGL.
         const geom = new THREE.CylinderGeometry(0.015, 0.015, len, 6, 1, true);
         const mat = new THREE.MeshBasicMaterial({
             color: colorHex ?? 0xff0000,
             transparent: true,
-            opacity: 0.9,
+            opacity: 0.28,
+            alphaMap: alphaTex,
+            side: THREE.DoubleSide,
             depthTest: false,
-            depthWrite: false
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            toneMapped: false
         });
         const mesh = new THREE.Mesh(geom, mat);
         mesh.frustumCulled = false;
@@ -1466,16 +1476,106 @@ export class GameEngine {
         this.effects.push({ obj: mesh, expiresAt: Date.now() + (lifetimeMs ?? 250) });
     }
 
+    getBeamAlphaTexture() {
+        if (this._beamAlphaTex) return this._beamAlphaTex;
+
+        const w = 256;
+        const h = 64;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(w, h);
+
+        for (let y = 0; y < h; y++) {
+            const v = h <= 1 ? 0.5 : y / (h - 1);
+            const vSin = Math.sin(Math.PI * v);
+            const vFactor = Math.pow(Math.max(0, vSin), 1.15);
+            for (let x = 0; x < w; x++) {
+                const u = w <= 1 ? 0.5 : x / (w - 1);
+                const uSin = Math.sin(Math.PI * u);
+                const uFactor = Math.pow(Math.max(0, uSin), 2.2);
+                const a = Math.max(0, Math.min(1, uFactor * vFactor));
+
+                const i = (y * w + x) * 4;
+                img.data[i + 0] = 255;
+                img.data[i + 1] = 255;
+                img.data[i + 2] = 255;
+                img.data[i + 3] = Math.round(255 * a);
+            }
+        }
+
+        ctx.putImageData(img, 0, 0);
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.ClampToEdgeWrapping;
+        tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.generateMipmaps = false;
+        tex.needsUpdate = true;
+
+        this._beamAlphaTex = tex;
+        return tex;
+    }
+
+    getMuzzleFlashTexture() {
+        if (this._flashTex) return this._flashTex;
+
+        const s = 128;
+        const canvas = document.createElement('canvas');
+        canvas.width = s;
+        canvas.height = s;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(s, s);
+
+        for (let y = 0; y < s; y++) {
+            const ny = (y / (s - 1)) * 2 - 1;
+            for (let x = 0; x < s; x++) {
+                const nx = (x / (s - 1)) * 2 - 1;
+                const r = Math.sqrt(nx * nx + ny * ny);
+                const core = Math.max(0, 1 - r);
+                const a = Math.pow(core, 2.6);
+                const i = (y * s + x) * 4;
+                img.data[i + 0] = 255;
+                img.data[i + 1] = 255;
+                img.data[i + 2] = 255;
+                img.data[i + 3] = Math.round(255 * a);
+            }
+        }
+
+        ctx.putImageData(img, 0, 0);
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.ClampToEdgeWrapping;
+        tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.generateMipmaps = false;
+        tex.needsUpdate = true;
+
+        this._flashTex = tex;
+        return tex;
+    }
+
     spawnMuzzleFlash(origin, lifetimeMs, colorHex) {
         if (!this.scene) return;
-        const geom = new THREE.SphereGeometry(0.06, 10, 8);
-        const mat = new THREE.MeshBasicMaterial({ color: colorHex ?? 0xffaa33, transparent: true, opacity: 0.9, depthTest: false });
-        const mesh = new THREE.Mesh(geom, mat);
-        mesh.position.copy(origin);
-        mesh.frustumCulled = false;
-        mesh.renderOrder = 1001;
-        this.scene.add(mesh);
-        this.effects.push({ obj: mesh, expiresAt: Date.now() + (lifetimeMs ?? 80) });
+        const tex = this.getMuzzleFlashTexture();
+        const mat = new THREE.SpriteMaterial({
+            map: tex,
+            color: colorHex ?? 0xffaa33,
+            transparent: true,
+            opacity: 0.55,
+            depthTest: false,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            toneMapped: false
+        });
+        const sprite = new THREE.Sprite(mat);
+        sprite.position.copy(origin);
+        sprite.scale.setScalar(0.18);
+        sprite.frustumCulled = false;
+        sprite.renderOrder = 1001;
+        this.scene.add(sprite);
+        this.effects.push({ obj: sprite, expiresAt: Date.now() + (lifetimeMs ?? 80) });
     }
 
     updateEffects(nowMs) {
