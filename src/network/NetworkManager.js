@@ -22,6 +22,12 @@ export class NetworkManager {
         this._handlersBound = false;
         this._peerMaintenanceTimer = null;
         this._lastStatusSignature = null;
+        // Player pruning should tolerate transient WebRTC hiccups.
+        // Nearby players get a longer grace to avoid "popping".
+        this._staleFarTimeoutMs = 20000;
+        this._staleNearTimeoutMs = 60000;
+        this._nearDistance = 80; // world units
+        this._disconnectGraceMs = 8000;
     }
 
     /**
@@ -158,6 +164,9 @@ export class NetworkManager {
 
             // Sync connected peers into our map
             this.syncPeersFromMesh();
+
+            // Remove players that are no longer connected / not updating
+            this.pruneStalePlayers();
         };
 
         // Run immediately and then periodically
@@ -186,6 +195,34 @@ export class NetworkManager {
             }
         } catch {
             // ignore
+        }
+    }
+
+    pruneStalePlayers() {
+        const now = Date.now();
+        for (const [peerId, player] of this.players.entries()) {
+            if (!peerId || peerId === this.peerId) continue;
+            const lastSeen = player?.lastSeen || player?.joinedAt || 0;
+
+            // Distance-based stale timeout (near players tolerated longer)
+            let staleTimeout = this._staleFarTimeoutMs;
+            if (this.localPlayer && typeof player?.x === 'number' && typeof player?.z === 'number') {
+                const dx = (player.x - this.localPlayer.x);
+                const dz = (player.z - this.localPlayer.z);
+                const dist = Math.hypot(dx, dz);
+                if (dist <= this._nearDistance) staleTimeout = this._staleNearTimeoutMs;
+            }
+
+            const stale = lastSeen > 0 && now - lastSeen > staleTimeout;
+
+            // If we saw an explicit disconnect, give a short grace window
+            const disconnectedAt = player?.disconnectedAt || 0;
+            const disconnectedTooLong = disconnectedAt > 0 && now - disconnectedAt > this._disconnectGraceMs;
+
+            if (stale || disconnectedTooLong) {
+                this.players.delete(peerId);
+                this.emit('player-left', peerId);
+            }
         }
     }
 
@@ -345,6 +382,14 @@ export class NetworkManager {
             this.peers.set(connectedPeerId, { id: connectedPeerId, connectedAt: Date.now() });
             this.emit('peer-connected', connectedPeerId);
 
+            // If they briefly disconnected, stop any pending prune.
+            const existing = this.players.get(connectedPeerId);
+            if (existing) {
+                existing.disconnectedAt = 0;
+                existing.lastSeen = Date.now();
+                this.players.set(connectedPeerId, existing);
+            }
+
             // Ensure late connections still see us.
             this.sendDirect(connectedPeerId, {
                 type: 'player-join',
@@ -377,7 +422,13 @@ export class NetworkManager {
             if (!disconnectedPeerId) return;
             console.log('Peer disconnected:', disconnectedPeerId);
             this.peers.delete(disconnectedPeerId);
-            this.players.delete(disconnectedPeerId);
+            // Don't instantly remove: WebRTC can flap briefly.
+            // Mark and let pruneStalePlayers() remove after a short grace.
+            const p = this.players.get(disconnectedPeerId);
+            if (p) {
+                p.disconnectedAt = Date.now();
+                this.players.set(disconnectedPeerId, p);
+            }
             this.emit('peer-disconnected', disconnectedPeerId);
         });
     }
@@ -419,7 +470,9 @@ export class NetworkManager {
             id: data.peerId,
             x: 0,
             y: 0,
-            joinedAt: data.timestamp
+            joinedAt: data.timestamp,
+            lastSeen: Date.now(),
+            disconnectedAt: 0
         });
         this.emit('player-joined', data.peerId);
 
@@ -437,6 +490,8 @@ export class NetworkManager {
 
         const player = this.players.get(data.peerId) || { id: data.peerId };
         Object.assign(player, data.state);
+        player.lastSeen = Date.now();
+        player.disconnectedAt = 0;
         this.players.set(data.peerId, player);
         
         this.emit('player-updated', player);
@@ -570,6 +625,11 @@ export class NetworkManager {
 
         if (this.mesh) {
             await this.mesh.disconnect();
+        }
+
+        if (this._peerMaintenanceTimer) {
+            clearInterval(this._peerMaintenanceTimer);
+            this._peerMaintenanceTimer = null;
         }
 
         this.connected = false;
