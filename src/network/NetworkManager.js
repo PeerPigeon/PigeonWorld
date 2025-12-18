@@ -24,10 +24,13 @@ export class NetworkManager {
         this._lastStatusSignature = null;
         // Player pruning should tolerate transient WebRTC hiccups.
         // Nearby players get a longer grace to avoid "popping".
-        this._staleFarTimeoutMs = 20000;
-        this._staleNearTimeoutMs = 60000;
+        this._staleFarTimeoutMs = 300000;
+        this._staleNearTimeoutMs = 600000;
         this._nearDistance = 80; // world units
-        this._disconnectGraceMs = 8000;
+        this._disconnectGraceMs = 60000;
+        // Keep peers around for a while even if the transport says "disconnected"
+        // so the game doesn't flicker players in/out during WebRTC flaps.
+        this._peerHardRemovalMs = 300000;
     }
 
     /**
@@ -179,19 +182,70 @@ export class NetworkManager {
 
         try {
             const peerList = this.mesh.getPeers?.() || [];
+            const now = Date.now();
+            const seen = new Set();
+
             // peerList items look like { peerId, status, ... }
-            const next = new Map();
             for (const p of peerList) {
                 if (!p || !p.peerId) continue;
-                if (p.status === 'connected' || p.status === 'channel-connecting') {
-                    next.set(p.peerId, { id: p.peerId, connectedAt: Date.now(), status: p.status });
+                if (p.peerId === this.peerId) continue;
+                const peerId = p.peerId;
+                const status = p.status || 'unknown';
+                seen.add(peerId);
+
+                const prev = this.peers.get(peerId);
+                const wasConnected = prev?.status === 'connected' || prev?.status === 'channel-connecting';
+                const isConnected = status === 'connected' || status === 'channel-connecting';
+
+                const next = {
+                    id: peerId,
+                    status,
+                    connectedAt: prev?.connectedAt || (isConnected ? now : 0),
+                    lastSeen: now,
+                    disconnectedAt: isConnected ? 0 : (prev?.disconnectedAt || now),
+                    missingSince: 0,
+                    lastConnectAttemptAt: prev?.lastConnectAttemptAt || 0
+                };
+
+                this.peers.set(peerId, next);
+
+                // Emit peer-connected once when we first see them connected/connecting.
+                if (!wasConnected && isConnected) {
+                    this.emit('peer-connected', peerId);
+                }
+
+                // If they're not connected, keep trying.
+                if (!isConnected && now - next.lastConnectAttemptAt > 2000) {
+                    next.lastConnectAttemptAt = now;
+                    this.peers.set(peerId, next);
+                    try {
+                        this.mesh.connectToPeer(peerId);
+                    } catch {
+                        // ignore
+                    }
                 }
             }
 
-            const changed = next.size !== this.peers.size;
-            this.peers = next;
-            if (changed) {
-                this.emit('peer-connected');
+            // Peers not present in the mesh snapshot: keep them around for a while.
+            for (const [peerId, prev] of this.peers.entries()) {
+                if (peerId === this.peerId) continue;
+                if (seen.has(peerId)) continue;
+
+                const missingSince = prev?.missingSince || now;
+                const next = {
+                    ...prev,
+                    status: prev?.status || 'unknown',
+                    missingSince,
+                    lastSeen: prev?.lastSeen || now,
+                    disconnectedAt: prev?.disconnectedAt || now
+                };
+                this.peers.set(peerId, next);
+
+                // Eventually remove truly-gone peers and surface a disconnect event.
+                if (now - missingSince > this._peerHardRemovalMs) {
+                    this.peers.delete(peerId);
+                    this.emit('peer-disconnected', peerId);
+                }
             }
         } catch {
             // ignore
@@ -203,11 +257,10 @@ export class NetworkManager {
         for (const [peerId, player] of this.players.entries()) {
             if (!peerId || peerId === this.peerId) continue;
 
-            // If the peer is currently connected at the transport layer, don't prune them.
+            // If the peer is currently connected/connecting at the transport layer, don't prune them.
             // It's better to keep a placeholder than to pop in/out due to missed updates.
-            if (this.peers && this.peers.has(peerId)) {
-                continue;
-            }
+            const peer = this.peers?.get(peerId);
+            if (peer && (peer.status === 'connected' || peer.status === 'channel-connecting')) continue;
             const lastSeen = player?.lastSeen || player?.joinedAt || 0;
 
             // Distance-based stale timeout (near players tolerated longer)
@@ -429,15 +482,32 @@ export class NetworkManager {
             const disconnectedPeerId = typeof data === 'string' ? data : data?.peerId;
             if (!disconnectedPeerId) return;
             console.log('Peer disconnected:', disconnectedPeerId);
-            this.peers.delete(disconnectedPeerId);
             // Don't instantly remove: WebRTC can flap briefly.
-            // Mark and let pruneStalePlayers() remove after a short grace.
+            // Keep the peer entry so the game doesn't flicker.
+            const now = Date.now();
+            const prevPeer = this.peers.get(disconnectedPeerId);
+            this.peers.set(disconnectedPeerId, {
+                id: disconnectedPeerId,
+                status: 'disconnected',
+                connectedAt: prevPeer?.connectedAt || 0,
+                lastSeen: prevPeer?.lastSeen || now,
+                disconnectedAt: prevPeer?.disconnectedAt || now,
+                missingSince: prevPeer?.missingSince || 0,
+                lastConnectAttemptAt: prevPeer?.lastConnectAttemptAt || 0
+            });
+
             const p = this.players.get(disconnectedPeerId);
             if (p) {
-                p.disconnectedAt = Date.now();
+                p.disconnectedAt = now;
                 this.players.set(disconnectedPeerId, p);
             }
-            this.emit('peer-disconnected', disconnectedPeerId);
+
+            // Try to reconnect immediately.
+            try {
+                this.mesh.connectToPeer(disconnectedPeerId);
+            } catch {
+                // ignore
+            }
         });
     }
 
@@ -460,6 +530,20 @@ export class NetworkManager {
                 break;
             case 'player-leave':
                 this.handlePlayerLeave(data);
+                break;
+            case 'player-shot':
+                // Broadcasted shot event for visuals.
+                this.emit('player-shot', data);
+                break;
+            case 'player-hit':
+                // Direct message to a target; the target decides what to do.
+                this.emit('player-hit', data);
+                break;
+            case 'player-died':
+                this.emit('player-died', data);
+                break;
+            case 'player-respawn':
+                this.emit('player-respawn', data);
                 break;
             case 'world-update':
                 this.handleWorldUpdate(data);
@@ -510,8 +594,13 @@ export class NetworkManager {
      */
     handlePlayerLeave(data) {
         console.log('Player left:', data.peerId);
-        this.players.delete(data.peerId);
-        this.emit('player-left', data.peerId);
+        // Treat this as a soft disconnect: keep the player entry for a while.
+        // This prevents brief reconnects from popping avatars out of the world.
+        const now = Date.now();
+        const player = this.players.get(data.peerId) || { id: data.peerId };
+        player.disconnectedAt = now;
+        player.lastSeen = player.lastSeen || now;
+        this.players.set(data.peerId, player);
     }
 
     /**
@@ -548,12 +637,14 @@ export class NetworkManager {
         if (!this.mesh || !this.connected) return;
         if (!peerId) return;
 
+        const payload = (typeof message === 'string') ? message : JSON.stringify(message);
+
         try {
             // Use DM (default subtype) because it's delivered to apps via `messageReceived`.
             if (typeof this.mesh.sendDirectMessage === 'function') {
-                await this.mesh.sendDirectMessage(peerId, message);
+                await this.mesh.sendDirectMessage(peerId, payload);
             } else {
-                await this.mesh.sendMessage(JSON.stringify(message));
+                await this.mesh.sendMessage(payload);
             }
         } catch {
             // ignore

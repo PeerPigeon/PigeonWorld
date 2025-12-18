@@ -24,7 +24,7 @@ export class GameEngine {
         // Track connectivity to avoid UI/player flicker on transient WebRTC disconnects.
         this.connectedPeers = new Set();
         this._peerDisconnectTimers = new Map();
-        this._peerDisconnectGraceMs = 8000;
+        this._peerDisconnectGraceMs = 120000;
         
         // Camera settings for first-person view
         this.cameraOffset = new THREE.Vector3(0, 1.6, 0); // Eye level height
@@ -48,8 +48,23 @@ export class GameEngine {
             speed: 8, // units/sec
             rotation: 0,
             size: 2,
-            color: '#FF5722'
+            color: '#FF5722',
+            health: 100,
+            alive: true
         };
+
+        // Shooting
+        this.shootCooldownMs = 350;
+        this.shootRange = 70;
+        this.shootDamage = 34;
+        this.lastShotAt = 0;
+        this.rWasDown = false;
+
+        // Debug/telemetry
+        this._shotsFired = 0;
+
+        // Simple transient visual effects (tracers, flashes)
+        this.effects = [];
 
         // Remote players
         this.remotePlayers = new Map();
@@ -113,6 +128,9 @@ export class GameEngine {
 
         // Initialize Three.js
         this.initThreeJS();
+
+        // Simple crosshair so you can aim
+        this.ensureAimDot();
 
         // Start loading the peer avatar model in the background
         this.loadRemoteAvatarModel();
@@ -245,6 +263,30 @@ export class GameEngine {
             this.camera.updateProjectionMatrix();
             this.renderer.setSize(window.innerWidth, window.innerHeight);
         });
+    }
+
+    ensureAimDot() {
+        // Keep this minimal and DOM-based so it works regardless of 3D state.
+        if (typeof document === 'undefined') return;
+        if (document.getElementById('aim-dot')) return;
+
+        const dot = document.createElement('div');
+        dot.id = 'aim-dot';
+        dot.setAttribute('aria-hidden', 'true');
+
+        dot.style.position = 'fixed';
+        dot.style.left = '50%';
+        dot.style.top = '50%';
+        dot.style.transform = 'translate(-50%, -50%)';
+        dot.style.width = '6px';
+        dot.style.height = '6px';
+        dot.style.borderRadius = '9999px';
+        dot.style.background = 'rgba(255,255,255,0.95)';
+        dot.style.border = '1px solid rgba(0,0,0,0.6)';
+        dot.style.pointerEvents = 'none';
+        dot.style.zIndex = '9999';
+
+        document.body.appendChild(dot);
     }
 
     /**
@@ -544,6 +586,46 @@ export class GameEngine {
                 }
             this.updateUI('peers', this.network.getPeerCount());
         });
+
+        // Shooting/hit/death events
+        this.network.on('player-shot', (data) => {
+            if (!data) return;
+            if (data.peerId && data.peerId === this.network.peerId) return;
+
+            const origin = data.origin ? new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z) : null;
+            if (!origin) return;
+
+            const hit = data.hit ? new THREE.Vector3(data.hit.x, data.hit.y, data.hit.z) : null;
+            const dir = data.dir ? new THREE.Vector3(data.dir.x, data.dir.y, data.dir.z) : null;
+            const range = (typeof data.range === 'number' ? data.range : this.shootRange);
+            const end = hit || (dir ? origin.clone().add(dir.normalize().multiplyScalar(range)) : null);
+            if (!end) return;
+
+            this.spawnTracer(origin, end, 160, 0xff0000);
+        });
+
+        this.network.on('player-hit', (data) => {
+            if (!data) return;
+            if (data.targetId !== this.network.peerId) return;
+            const damage = typeof data.damage === 'number' ? data.damage : this.shootDamage;
+            this.applyLocalDamage(damage, data.peerId);
+        });
+
+        this.network.on('player-died', (data) => {
+            const peerId = data?.peerId;
+            if (!peerId || peerId === this.network.peerId) return;
+            const group = this.remoteMeshes.get(peerId);
+            if (!group) return;
+            this.triggerRemoteDeath(group);
+        });
+
+        this.network.on('player-respawn', (data) => {
+            const peerId = data?.peerId;
+            if (!peerId || peerId === this.network.peerId) return;
+            const group = this.remoteMeshes.get(peerId);
+            if (!group) return;
+            this.clearRemoteDeath(group);
+        });
     }
 
     getDeterministicPeerOffset(peerId) {
@@ -587,7 +669,7 @@ export class GameEngine {
             this.keys[key] = true;
             
             // Prevent default for game keys
-            if (['w', 'a', 's', 'd', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+            if (['w', 'a', 's', 'd', 'r', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
                 e.preventDefault();
             }
         });
@@ -655,6 +737,13 @@ export class GameEngine {
      * Update game state
      */
     update(deltaTime, now) {
+        // Shooting input (edge-triggered)
+        const rDown = !!this.keys['r'];
+        if (rDown && !this.rWasDown) {
+            this.tryShoot(now);
+        }
+        this.rWasDown = rDown;
+
         // Update player movement
         this.updatePlayer(deltaTime);
 
@@ -666,6 +755,9 @@ export class GameEngine {
 
         // Update remote players
         this.updateRemotePlayers();
+
+        // Update transient effects
+        this.updateEffects(now);
 
         // Send player update to network (throttled to ~20 updates per second)
         const timeSinceLastNetworkUpdate = now - this.lastNetworkUpdate;
@@ -687,6 +779,13 @@ export class GameEngine {
      */
     updatePlayer(deltaTime) {
         const dt = deltaTime / 1000;
+
+        if (!this.player.alive) {
+            // No movement while dead.
+            this.player.vx = 0;
+            this.player.vz = 0;
+            return;
+        }
         const speed = this.player.speed * dt;
 
         // Optional keyboard turning (useful before pointer lock or without mouse)
@@ -811,10 +910,11 @@ export class GameEngine {
      * Update remote player meshes
      */
     updateRemotePlayers() {
-        const now = (typeof performance !== 'undefined' && typeof performance.now === 'function')
+        const nowPerf = (typeof performance !== 'undefined' && typeof performance.now === 'function')
             ? performance.now()
             : Date.now();
-        const renderTime = now - this.remoteInterpolationDelayMs;
+        const nowEpoch = Date.now();
+        const renderTime = nowPerf - this.remoteInterpolationDelayMs;
 
         // Update existing remote player meshes
         for (const [peerId, player] of this.remotePlayers.entries()) {
@@ -839,13 +939,38 @@ export class GameEngine {
             
             const group = this.remoteMeshes.get(peerId);
 
+            // Ensure the red overlay exists for already-spawned glTF avatars.
+            const gltfAvatar = group?.userData?.gltfAvatar;
+            if (gltfAvatar?.root) {
+                const existing = gltfAvatar.root.getObjectByName('opponentAccessories');
+                if (!existing) {
+                    const clonedScene = gltfAvatar.root.children?.find((c) => c && c.name !== 'opponentAccessories') || gltfAvatar.root.children?.[0];
+                    const scale = gltfAvatar.root.scale?.x || 1;
+                    const accessories = this.createOpponentRobotAccessories(clonedScene, scale);
+                    if (accessories) {
+                        gltfAvatar.root.add(accessories);
+                    }
+                }
+            }
+
+            const deadUntilEpoch = group.userData?.deadUntilEpoch || 0;
+            const deadPose = group.userData?.deadPose || null;
+            const isDead = deadUntilEpoch && deadUntilEpoch > nowEpoch;
+
+            if (isDead && deadPose) {
+                group.position.set(deadPose.x, deadPose.y, deadPose.z);
+                group.rotation.y = deadPose.r;
+                this.animateRemoteAvatar(group, { vx: 0, vy: 0, vz: 0 }, nowPerf);
+                continue;
+            }
+
             const pose = this.getRemoteRenderPose(peerId, player, renderTime);
             // Networked player.y is the *center* of the capsule (ground + this.player.size).
             // Our avatar roots (procedural + glTF) are built with feet at y=0, so place them at ground level.
             const feetY = (typeof pose.y === 'number' ? pose.y : 0) - this.player.size;
             group.position.set(pose.x, feetY, pose.z);
             group.rotation.y = pose.r;
-            this.animateRemoteAvatar(group, pose, now);
+            this.animateRemoteAvatar(group, pose, nowPerf);
         }
         
         // Remove meshes for disconnected players
@@ -864,6 +989,202 @@ export class GameEngine {
         this.renderer.render(this.scene, this.camera);
     }
 
+    tryShoot(nowMs) {
+        if (!this.player.alive) return;
+        if (nowMs - this.lastShotAt < this.shootCooldownMs) return;
+        this.lastShotAt = nowMs;
+        this._shotsFired++;
+
+        const origin = this.camera?.position?.clone?.();
+        if (!origin) return;
+        const dir = new THREE.Vector3();
+        this.camera.getWorldDirection(dir);
+        dir.normalize();
+
+        const raycaster = new THREE.Raycaster(origin, dir, 0, this.shootRange);
+
+        let best = null;
+        for (const [peerId, group] of this.remoteMeshes.entries()) {
+            if (!peerId || !group) continue;
+            if (group.userData?.deadUntilEpoch && group.userData.deadUntilEpoch > nowMs) continue;
+
+            const hits = raycaster.intersectObject(group, true);
+            if (!hits || hits.length === 0) continue;
+            const h = hits[0];
+            if (!best || h.distance < best.distance) {
+                best = { peerId, distance: h.distance, point: h.point.clone() };
+            }
+        }
+
+        const end = best ? best.point : origin.clone().add(dir.clone().multiplyScalar(this.shootRange));
+        this.spawnTracer(origin, end, 450, 0xff0000);
+        this.spawnMuzzleFlash(origin.clone().add(dir.clone().multiplyScalar(0.25)), 180, 0xffaa33);
+
+        // Broadcast shot for other clients' visuals
+        this.network.broadcast({
+            type: 'player-shot',
+            worldId: this.network.worldId,
+            peerId: this.network.peerId,
+            origin: { x: origin.x, y: origin.y, z: origin.z },
+            dir: { x: dir.x, y: dir.y, z: dir.z },
+            hit: best ? { x: end.x, y: end.y, z: end.z } : null,
+            range: this.shootRange,
+            timestamp: Date.now()
+        });
+
+        // If we hit a player, send a direct hit to the target.
+        if (best?.peerId) {
+            const msg = {
+                type: 'player-hit',
+                worldId: this.network.worldId,
+                peerId: this.network.peerId,
+                targetId: best.peerId,
+                damage: this.shootDamage,
+                hit: { x: end.x, y: end.y, z: end.z },
+                timestamp: Date.now()
+            };
+            this.network.sendDirect(best.peerId, msg);
+        }
+    }
+
+    spawnTracer(start, end, lifetimeMs, colorHex) {
+        if (!this.scene) return;
+        const a = start.clone();
+        const b = end.clone();
+        const dir = b.clone().sub(a);
+        const len = dir.length();
+        if (!isFinite(len) || len <= 0.001) return;
+        dir.normalize();
+
+        // A thin cylinder is much more visible than a line in WebGL.
+        const geom = new THREE.CylinderGeometry(0.015, 0.015, len, 6, 1, true);
+        const mat = new THREE.MeshBasicMaterial({
+            color: colorHex ?? 0xff0000,
+            transparent: true,
+            opacity: 0.9,
+            depthTest: false,
+            depthWrite: false
+        });
+        const mesh = new THREE.Mesh(geom, mat);
+        mesh.frustumCulled = false;
+        mesh.renderOrder = 2000;
+
+        // Cylinder default axis is +Y; rotate to match dir.
+        const mid = a.clone().add(b).multiplyScalar(0.5);
+        mesh.position.copy(mid);
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+
+        this.scene.add(mesh);
+        this.effects.push({ obj: mesh, expiresAt: Date.now() + (lifetimeMs ?? 250) });
+    }
+
+    spawnMuzzleFlash(origin, lifetimeMs, colorHex) {
+        if (!this.scene) return;
+        const geom = new THREE.SphereGeometry(0.06, 10, 8);
+        const mat = new THREE.MeshBasicMaterial({ color: colorHex ?? 0xffaa33, transparent: true, opacity: 0.9, depthTest: false });
+        const mesh = new THREE.Mesh(geom, mat);
+        mesh.position.copy(origin);
+        mesh.frustumCulled = false;
+        mesh.renderOrder = 1001;
+        this.scene.add(mesh);
+        this.effects.push({ obj: mesh, expiresAt: Date.now() + (lifetimeMs ?? 80) });
+    }
+
+    updateEffects(nowMs) {
+        const now = typeof nowMs === 'number' ? nowMs : Date.now();
+        if (!this.effects || this.effects.length === 0) return;
+        const next = [];
+        for (const e of this.effects) {
+            if (!e || !e.obj) continue;
+            if (now >= e.expiresAt) {
+                this.scene.remove(e.obj);
+                try {
+                    e.obj.geometry?.dispose?.();
+                    if (Array.isArray(e.obj.material)) e.obj.material.forEach((m) => m?.dispose?.());
+                    else e.obj.material?.dispose?.();
+                } catch {
+                    // ignore
+                }
+                continue;
+            }
+            next.push(e);
+        }
+        this.effects = next;
+    }
+
+    applyLocalDamage(damage, fromPeerId) {
+        if (!this.player.alive) return;
+        const d = Math.max(0, damage || 0);
+        this.player.health = Math.max(0, (this.player.health || 0) - d);
+
+        if (this.player.health <= 0) {
+            this.player.alive = false;
+            this.updateUI('status', 'You died');
+
+            // Tell others we died (so they can animate our avatar)
+            this.network.broadcast({
+                type: 'player-died',
+                worldId: this.network.worldId,
+                peerId: this.network.peerId,
+                killerId: fromPeerId || null,
+                timestamp: Date.now()
+            });
+
+            // Respawn after a short delay
+            setTimeout(() => {
+                this.player.health = 100;
+                this.player.alive = true;
+                this.updateUI('status', 'Connected');
+                this.network.broadcast({
+                    type: 'player-respawn',
+                    worldId: this.network.worldId,
+                    peerId: this.network.peerId,
+                    timestamp: Date.now()
+                });
+            }, 2500);
+        }
+    }
+
+    triggerRemoteDeath(group) {
+        const untilEpoch = Date.now() + 2500;
+        group.userData.deadUntilEpoch = untilEpoch;
+        group.userData.deadPose = {
+            x: group.position.x,
+            y: group.position.y,
+            z: group.position.z,
+            r: group.rotation.y
+        };
+
+        // Visual fallback if the model doesn't have a death clip.
+        group.userData.deadRotX = -1.25;
+        group.rotation.x = group.userData.deadRotX;
+
+        const gltfAvatar = group.userData?.gltfAvatar;
+        if (gltfAvatar?.mixer) {
+            if (gltfAvatar.clips?.death) {
+                // Ensure one-shot
+                try {
+                    gltfAvatar.clips.death.setLoop(THREE.LoopOnce, 1);
+                    gltfAvatar.clips.death.clampWhenFinished = true;
+                } catch {
+                    // ignore
+                }
+                this.setGltfAvatarAction(gltfAvatar, 'death', 0.05);
+            }
+        }
+    }
+
+    clearRemoteDeath(group) {
+        group.userData.deadUntilEpoch = 0;
+        group.userData.deadPose = null;
+        group.userData.deadRotX = 0;
+        group.rotation.x = 0;
+        const gltfAvatar = group.userData?.gltfAvatar;
+        if (gltfAvatar?.mixer) {
+            // Return to idle quickly
+            this.setGltfAvatarAction(gltfAvatar, 'idle', 0.08);
+        }
+    }
     ingestRemotePlayerUpdate(player) {
         if (!player || !player.id) return;
         const now = (typeof performance !== 'undefined' && typeof performance.now === 'function')
@@ -978,14 +1299,24 @@ export class GameEngine {
         return a + delta * t;
     }
 
-    createPigeonHead() {
+    createPigeonHead(options = {}) {
         const root = new THREE.Group();
+        root.name = 'pigeonHead';
+
+        const eyeColor = (options && typeof options.eyeColor === 'string') ? options.eyeColor : '#111111';
+        const glassesColor = (options && typeof options.glassesColor === 'string') ? options.glassesColor : null;
 
         // Origin is at the base of the neck.
         // Avatar forward is -Z (our yaw=0 convention).
         const headMat = new THREE.MeshStandardMaterial({ color: '#7f8fa3', metalness: 0.05, roughness: 0.9 });
         const beakMat = new THREE.MeshStandardMaterial({ color: '#f2a23a', metalness: 0.05, roughness: 0.75 });
-        const eyeMat = new THREE.MeshStandardMaterial({ color: '#111111', metalness: 0.0, roughness: 0.8 });
+        const eyeMat = new THREE.MeshStandardMaterial({
+            color: eyeColor,
+            emissive: new THREE.Color(eyeColor),
+            emissiveIntensity: 1.0,
+            metalness: 0.0,
+            roughness: 0.35
+        });
 
         // Head (slightly squashed sphere)
         const head = new THREE.Mesh(new THREE.SphereGeometry(0.32, 16, 12), headMat);
@@ -1012,16 +1343,200 @@ export class GameEngine {
 
         // Eyes
         const leftEye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), eyeMat);
+        leftEye.name = 'pigeonEyeL';
         leftEye.position.set(-0.13, 0.31, -0.12);
         leftEye.castShadow = true;
         leftEye.receiveShadow = true;
         root.add(leftEye);
 
         const rightEye = leftEye.clone();
+        rightEye.name = 'pigeonEyeR';
         rightEye.position.x = 0.13;
         root.add(rightEye);
 
+        if (glassesColor) {
+            const glassesMat = new THREE.MeshStandardMaterial({
+                color: glassesColor,
+                emissive: new THREE.Color(glassesColor),
+                emissiveIntensity: 1.0,
+                metalness: 0.15,
+                roughness: 0.35,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            const glasses = new THREE.Group();
+            glasses.name = 'pigeonGlasses';
+
+            // Two rings + bridge, positioned to sit around the eyes.
+            const ringGeom = new THREE.TorusGeometry(0.105, 0.018, 10, 18);
+            const leftRing = new THREE.Mesh(ringGeom, glassesMat);
+            leftRing.position.set(-0.13, 0.31, -0.10);
+            leftRing.rotation.x = Math.PI / 2;
+            leftRing.castShadow = true;
+            glasses.add(leftRing);
+
+            const rightRing = leftRing.clone();
+            rightRing.position.x = 0.13;
+            glasses.add(rightRing);
+
+            const bridge = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.12, 10), glassesMat);
+            bridge.position.set(0, 0.31, -0.10);
+            bridge.rotation.z = Math.PI / 2;
+            bridge.castShadow = true;
+            glasses.add(bridge);
+
+            // Tiny temples (short lines going back)
+            const templeGeom = new THREE.CylinderGeometry(0.01, 0.01, 0.18, 8);
+            const leftTemple = new THREE.Mesh(templeGeom, glassesMat);
+            leftTemple.position.set(-0.22, 0.31, -0.02);
+            leftTemple.rotation.x = Math.PI / 2;
+            leftTemple.rotation.z = 0.15;
+            glasses.add(leftTemple);
+
+            const rightTemple = leftTemple.clone();
+            rightTemple.position.x = 0.22;
+            rightTemple.rotation.z = -0.15;
+            glasses.add(rightTemple);
+
+            root.add(glasses);
+        }
+
         return root;
+    }
+
+    setPigeonEyeColor(headRoot, eyeColor) {
+        if (!headRoot || !eyeColor) return;
+        headRoot.traverse((obj) => {
+            if (!obj || !obj.isMesh) return;
+            if (obj.name !== 'pigeonEyeL' && obj.name !== 'pigeonEyeR') return;
+            this.setMaterialColorAndEmissive(obj.material, eyeColor);
+        });
+    }
+
+    setOpponentEyeColor(groupRoot, eyeColor) {
+        if (!groupRoot || !eyeColor) return;
+        groupRoot.traverse((obj) => {
+            if (!obj || !obj.isMesh) return;
+
+            const name = (obj.name || '').toLowerCase();
+            const isPigeonEye = obj.name === 'pigeonEyeL' || obj.name === 'pigeonEyeR';
+            const isEyeMesh = isPigeonEye || name.includes('eye');
+            if (!isEyeMesh) return;
+
+            this.setMaterialColorAndEmissive(obj.material, eyeColor);
+        });
+    }
+
+    setOpponentGlassesColor(groupRoot, color) {
+        if (!groupRoot || !color) return;
+        groupRoot.traverse((obj) => {
+            if (!obj || !obj.isMesh) return;
+
+            const name = (obj.name || '').toLowerCase();
+            const matName = (obj.material?.name || '').toLowerCase();
+
+            // Heuristic matching across common glTF naming.
+            const looksLikeGlasses =
+                name.includes('glasses') ||
+                name.includes('goggles') ||
+                name.includes('spectacle') ||
+                name.includes('lens') ||
+                (name.includes('glass') && (name.includes('frame') || name.includes('eye') || name.includes('goggle')));
+
+            const looksLikeGlassesMat =
+                matName.includes('glasses') ||
+                matName.includes('goggles') ||
+                matName.includes('spectacle') ||
+                matName.includes('lens');
+
+            if (!looksLikeGlasses && !looksLikeGlassesMat) return;
+
+            this.setMaterialColorAndEmissive(obj.material, color);
+
+            // If the material supports transparency, keep it visibly tinted red.
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (!m) continue;
+                if (typeof m.transparent === 'boolean') m.transparent = true;
+                if (typeof m.opacity === 'number') m.opacity = Math.max(m.opacity, 0.6);
+            }
+        });
+    }
+
+    forceRedOnLikelyHeadAccessories(groupRoot, color) {
+        // Last-resort fallback: some models have eyes/glasses with non-obvious names/materials.
+        // We identify small meshes in the top region of the avatar and tint them red.
+        if (!groupRoot || !color) return;
+
+        let rootBox;
+        try {
+            rootBox = new THREE.Box3().setFromObject(groupRoot);
+        } catch {
+            return;
+        }
+
+        const size = new THREE.Vector3();
+        rootBox.getSize(size);
+        if (!isFinite(size.y) || size.y <= 0) return;
+
+        const headCutY = rootBox.min.y + size.y * 0.72;
+        const maxDiag = Math.hypot(size.x, size.y, size.z);
+        const smallDiagThreshold = Math.max(0.25, maxDiag * 0.18);
+
+        groupRoot.traverse((obj) => {
+            if (!obj || !obj.isMesh) return;
+            if (obj.visible === false) return;
+            if (obj.name === 'pigeonEyeL' || obj.name === 'pigeonEyeR') return;
+            if (obj.name === 'pigeonHead') return;
+
+            let box;
+            try {
+                box = new THREE.Box3().setFromObject(obj);
+            } catch {
+                return;
+            }
+
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            if (!isFinite(center.y)) return;
+            if (center.y < headCutY) return;
+
+            const bsz = new THREE.Vector3();
+            box.getSize(bsz);
+            const diag = Math.hypot(bsz.x, bsz.y, bsz.z);
+            if (!isFinite(diag) || diag > smallDiagThreshold) return;
+
+            // Likely eye/glasses/accessory: force tint.
+            this.setMaterialColorAndEmissive(obj.material, color);
+
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (!m) continue;
+                if ('map' in m && m.map) m.map = null;
+                if ('alphaMap' in m && m.alphaMap) m.alphaMap = null;
+                if (typeof m.transparent === 'boolean') m.transparent = true;
+                if (typeof m.opacity === 'number') m.opacity = Math.max(m.opacity, 0.7);
+            }
+        });
+    }
+
+    setMaterialColorAndEmissive(material, color) {
+        if (!material) return;
+
+        const apply = (mat) => {
+            if (!mat) return;
+            if (mat.color && typeof mat.color.set === 'function') mat.color.set(color);
+            if (mat.emissive && typeof mat.emissive.set === 'function') mat.emissive.set(color);
+            if (typeof mat.emissiveIntensity === 'number') mat.emissiveIntensity = Math.max(mat.emissiveIntensity, 1.0);
+            mat.needsUpdate = true;
+        };
+
+        if (Array.isArray(material)) {
+            for (const m of material) apply(m);
+        } else {
+            apply(material);
+        }
     }
 
     createRemoteAvatarModel() {
@@ -1047,7 +1562,7 @@ export class GameEngine {
         neck.receiveShadow = true;
         root.add(neck);
 
-        const head = this.createPigeonHead();
+        const head = this.createPigeonHead({ eyeColor: '#ff0000', glassesColor: '#ff0000' });
         head.position.set(0, 2.73, 0);
         head.castShadow = true;
         head.receiveShadow = true;
@@ -1128,20 +1643,25 @@ export class GameEngine {
         // If we have a loaded glTF avatar, animate using its clips/mixer.
         const gltfAvatar = group?.userData?.gltfAvatar;
         if (gltfAvatar?.mixer) {
+            const deadUntilEpoch = group?.userData?.deadUntilEpoch || 0;
+            const isDead = deadUntilEpoch && deadUntilEpoch > Date.now();
+
             const vx = typeof pose?.vx === 'number' ? pose.vx : 0;
             const vz = typeof pose?.vz === 'number' ? pose.vz : 0;
             const speed = Math.hypot(vx, vz);
             const walkFactor = Math.max(0, Math.min(1, speed / 6));
 
-            // Pick best available action based on speed.
-            const desired = (walkFactor > 0.2)
-                ? (gltfAvatar.clips.run ? 'run' : (gltfAvatar.clips.walk ? 'walk' : 'idle'))
-                : 'idle';
+            if (!isDead) {
+                // Pick best available action based on speed.
+                const desired = (walkFactor > 0.2)
+                    ? (gltfAvatar.clips.run ? 'run' : (gltfAvatar.clips.walk ? 'walk' : 'idle'))
+                    : 'idle';
 
-            this.setGltfAvatarAction(gltfAvatar, desired, 0.12);
+                this.setGltfAvatarAction(gltfAvatar, desired, 0.12);
+            }
 
             // Scale animation rate slightly with movement.
-            const rate = 0.8 + walkFactor * 1.4;
+            const rate = isDead ? 1.0 : (0.8 + walkFactor * 1.4);
             if (gltfAvatar.activeAction) {
                 gltfAvatar.activeAction.timeScale = rate;
             }
@@ -1258,21 +1778,12 @@ export class GameEngine {
             : 1.0;
         root.scale.setScalar(scale);
 
-        // Hide the glTF's original head/face meshes so the pigeon head is the only head.
-        // Heuristic names across common rigs (RobotExpressive, Mixamo, VRM-ish exports, etc.)
-        clonedScene.traverse((obj) => {
-            if (!obj || !obj.isMesh) return;
-            const n = (obj.name || '').toLowerCase();
-            if (/(^|\b)(head|face|eye|teeth|tongue|hair|brow|eyebrow)(\b|$)/.test(n)) {
-                obj.visible = false;
-            }
-        });
-
-        // Attach a pigeon head at a consistent height in our world units.
-        const pigeonHead = this.createPigeonHead();
-        // For a ~1.7m scaled avatar, head base sits around 1.35-1.45.
-        pigeonHead.position.set(0, 1.42, 0);
-        root.add(pigeonHead);
+        // Add an explicit, always-visible red glasses / eye-glow overlay for opponents.
+        // This avoids relying on unknown mesh/material names or baked textures.
+        const accessories = this.createOpponentRobotAccessories(clonedScene, scale);
+        if (accessories) {
+            root.add(accessories);
+        }
 
         const mixer = new THREE.AnimationMixer(clonedScene);
         const actionsByName = new Map();
@@ -1281,10 +1792,11 @@ export class GameEngine {
         }
 
         // Create semantic actions if we can
-        const semantic = { idle: null, walk: null, run: null };
+        const semantic = { idle: null, walk: null, run: null, death: null };
         if (this.remoteAvatarTemplate.clips.idle) semantic.idle = mixer.clipAction(this.remoteAvatarTemplate.clips.idle);
         if (this.remoteAvatarTemplate.clips.walk) semantic.walk = mixer.clipAction(this.remoteAvatarTemplate.clips.walk);
         if (this.remoteAvatarTemplate.clips.run) semantic.run = mixer.clipAction(this.remoteAvatarTemplate.clips.run);
+        if (this.remoteAvatarTemplate.clips.death) semantic.death = mixer.clipAction(this.remoteAvatarTemplate.clips.death);
 
         // Default action
         const defaultAction = semantic.idle || semantic.walk || semantic.run || (this.remoteAvatarTemplate.animations[0] ? mixer.clipAction(this.remoteAvatarTemplate.animations[0]) : null);
@@ -1299,12 +1811,92 @@ export class GameEngine {
             clips: {
                 idle: semantic.idle,
                 walk: semantic.walk,
-                run: semantic.run
+                run: semantic.run,
+                death: semantic.death
             },
             activeName: defaultAction === semantic.walk ? 'walk' : (defaultAction === semantic.run ? 'run' : 'idle'),
             activeAction: defaultAction,
             _lastT: null
         };
+    }
+
+    createOpponentRobotAccessories(clonedScene, scale) {
+        if (!clonedScene) return null;
+
+        // Compute bounds in source units (before root scaling is applied).
+        let box;
+        try {
+            box = new THREE.Box3().setFromObject(clonedScene);
+        } catch {
+            return null;
+        }
+
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        if (!isFinite(size.y) || size.y <= 0) return null;
+
+        const invScale = (typeof scale === 'number' && isFinite(scale) && scale > 0.0001) ? (1 / scale) : 1;
+
+        // Place around the upper head region.
+        const cx = (box.min.x + box.max.x) / 2;
+        const cz = (box.min.z + box.max.z) / 2;
+        const eyeY = box.min.y + size.y * 0.86;
+
+        // Sizes expressed in world-ish units, converted to local by invScale.
+        const ringR = 0.18 * invScale;
+        const ringT = 0.035 * invScale;
+        const eyeX = 0.16 * invScale;
+        const forwardZ = -0.14 * invScale;
+
+        // Bright, unlit, always-on-top overlay so it's visible regardless of lighting or textures.
+        const mat = new THREE.MeshBasicMaterial({
+            color: '#ff0000',
+            transparent: true,
+            opacity: 1.0,
+            depthTest: false,
+            depthWrite: false
+        });
+
+        const root = new THREE.Group();
+        root.name = 'opponentAccessories';
+        root.position.set(cx, eyeY, cz);
+        root.renderOrder = 999;
+
+        // Glasses frame
+        const ringGeom = new THREE.TorusGeometry(ringR, ringT, 10, 18);
+        const leftRing = new THREE.Mesh(ringGeom, mat);
+        leftRing.position.set(-eyeX, 0, forwardZ);
+        leftRing.rotation.x = Math.PI / 2;
+        leftRing.castShadow = false;
+        leftRing.frustumCulled = false;
+        leftRing.renderOrder = 999;
+        root.add(leftRing);
+
+        const rightRing = leftRing.clone();
+        rightRing.position.x = eyeX;
+        root.add(rightRing);
+
+        const bridge = new THREE.Mesh(new THREE.CylinderGeometry(0.012 * invScale, 0.012 * invScale, 0.14 * invScale, 10), mat);
+        bridge.position.set(0, 0, forwardZ);
+        bridge.rotation.z = Math.PI / 2;
+        bridge.castShadow = false;
+        bridge.frustumCulled = false;
+        bridge.renderOrder = 999;
+        root.add(bridge);
+
+        // Eye glow dots (helps even if glasses frame sits oddly)
+        const eyeGlowGeom = new THREE.SphereGeometry(0.03 * invScale, 12, 10);
+        const leftGlow = new THREE.Mesh(eyeGlowGeom, mat);
+        leftGlow.position.set(-eyeX, -0.01 * invScale, forwardZ);
+        leftGlow.castShadow = false;
+        leftGlow.frustumCulled = false;
+        leftGlow.renderOrder = 999;
+        root.add(leftGlow);
+        const rightGlow = leftGlow.clone();
+        rightGlow.position.x = eyeX;
+        root.add(rightGlow);
+
+        return root;
     }
 
     pickGltfClips(animations) {
@@ -1318,8 +1910,9 @@ export class GameEngine {
         const idle = byName('idle') || byName('survey') || byName('standing') || null;
         const walk = byName('walk') || byName('walking') || null;
         const run = byName('run') || byName('running') || null;
+        const death = byName('death') || byName('dead') || byName('die') || null;
 
-        return { idle, walk, run };
+        return { idle, walk, run, death };
     }
 
     setGltfAvatarAction(gltfAvatar, desiredName, fadeSec) {
